@@ -1,0 +1,29 @@
+#!/bin/bash
+# gd-edit 启动脚本：配置 Java 11 + Clojure 环境并启动编辑器。
+# 用法:
+#   ./scripts/run                        交互式启动（默认）
+#   ./scripts/run -f <存档>             启动并加载存档
+#   ./scripts/run -b <批处理文件>       批处理模式
+#   ./scripts/run -h                    显示帮助
+# 其余参数原样透传给 gd-edit。
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ---- 配置运行环境 ----
+# 切换 Java 11（gd-edit 需要 64 位 JVM，11 已验证可用）
+if [ -n "${JAVA_HOME_11:-}" ]; then
+    export JAVA_HOME="$JAVA_HOME_11"
+    export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
+# Clojure CLI（若已安装则无需）
+if [ -x "/home/von/library/clojure/bin/clojure" ]; then
+    export PATH="/home/von/library/clojure/bin:$PATH"
+fi
+
+cd "$REPO_DIR"
+
+# 参数为空时仍可走默认交互；透传 "$@" 给 clojure -M -m gd-edit.core
+clojure -M -m gd-edit.core "$@"

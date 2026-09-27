@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gd-edit 存档查看器</title>
+<style>
+  :root {
+    --bg: #171a1f;
+    --panel: #20242b;
+    --panel-2: #272c35;
+    --text: #d7dde6;
+    --muted: #8b94a3;
+    --accent: #4f9cf9;
+    --border: #343b46;
+    --danger: #e5484d;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: "PingFang SC", "Microsoft YaHei", system-ui, sans-serif;
+    height: 100vh; display: flex; flex-direction: column;
+  }
+  header {
+    padding: 14px 20px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: baseline; gap: 12px;
+  }
+  header h1 { font-size: 18px; font-weight: 600; }
+  header span { color: var(--muted); font-size: 13px; }
+  main { flex: 1; display: flex; min-height: 0; }
+  #list-pane {
+    width: 260px; overflow-y: auto; background: var(--panel);
+    border-right: 1px solid var(--border); padding: 10px;
+  }
+  #list-pane h2 { font-size: 13px; color: var(--muted); margin: 10px 8px 8px; }
+  #list-pane h2:first-child { margin-top: 2px; }
+  .char {
+    display: block; width: 100%; text-align: left;
+    padding: 10px 12px; margin-bottom: 6px;
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px;
+    cursor: pointer; font-size: 14px;
+  }
+  .char:hover { border-color: var(--accent); }
+  .char.active { border-color: var(--accent); background: #26313f; }
+  #detail-pane { flex: 1; overflow-y: auto; padding: 20px 26px; }
+  #detail-empty { color: var(--muted); margin-top: 40px; text-align: center; }
+  .char-title { font-size: 17px; font-weight: 600; margin-bottom: 14px; }
+  table { border-collapse: collapse; width: 100%; max-width: 520px; }
+  td {
+    padding: 8px 14px; border-bottom: 1px solid var(--border);
+    font-size: 14px;
+  }
+  td:first-child { color: var(--muted); width: 40%; }
+  td:last-child { font-variant-numeric: tabular-nums; }
+  #error {
+    display: none; position: fixed; top: 14px; left: 50%;
+    transform: translateX(-50%);
+    background: var(--danger); color: #fff; padding: 10px 18px;
+    border-radius: 6px; font-size: 13px; z-index: 10;
+  }
+  #toast {
+    display: none; position: fixed; top: 14px; left: 50%;
+    transform: translateX(-50%);
+    background: #2f9e44; color: #fff; padding: 10px 18px;
+    border-radius: 6px; font-size: 13px; z-index: 10;
+  }
+  input[type=number] {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 8px; font-size: 14px; width: 150px;
+  }
+  .small-btn {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 10px; margin-left: 6px; cursor: pointer; font-size: 13px;
+  }
+  .small-btn:hover { border-color: var(--accent); }
+  .small-btn.primary { border-color: var(--accent); color: #cfe4ff; }
+  .small-btn:disabled { opacity: 0.5; cursor: default; }
+
+  /* ---- 公共仓库 ---- */
+  #stash-view { max-width: 1100px; }
+  #stash-toolbar { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; margin-bottom: 12px; }
+  #stash-settings { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; font-size: 13px; color: var(--muted); }
+  #stash-settings label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
+  #stash-settings input[type=checkbox] { accent-color: var(--accent); }
+  #stash-settings input[type=number] { width: 62px; padding: 3px 6px; font-size: 13px; }
+  #stash-settings .small-btn { padding: 3px 9px; margin-left: 0; }
+  #stash-modes select {
+    background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 4px 8px; font-size: 13px; margin-left: 6px;
+  }
+  #stash-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
+  .tab-btn {
+    background: var(--panel-2); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 5px;
+    padding: 5px 10px; font-size: 12px; cursor: pointer;
+  }
+  .tab-btn:hover { color: var(--text); border-color: var(--accent); }
+  .tab-btn.active { color: #cfe4ff; border-color: var(--accent); background: #26313f; }
+  #stash-grid {
+    position: relative;
+    background-image:
+      linear-gradient(to right, rgba(255,255,255,0.06) 1px, transparent 1px),
+      linear-gradient(to bottom, rgba(255,255,255,0.06) 1px, transparent 1px);
+    background-size: var(--cell, 38px) var(--cell, 38px);
+    box-shadow: inset 0 0 0 1px var(--border);
+  }
+  .stash-item {
+    position: absolute;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(42,51,63,0.95);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 2px 3px;
+    font-size: 11px; line-height: 1.2;
+    cursor: default;
+  }
+  .stash-item:hover { outline: 1px solid #fff; z-index: 2; }
+  .stash-item .st-name {
+    overflow: hidden; text-overflow: ellipsis;
+    white-space: nowrap; min-width: 0;
+  }
+  .stash-item .st-count {
+    position: absolute; right: 2px; bottom: 1px;
+    font-size: 10px; color: #ffe08a;
+  }
+  .stash-item .st-rarity {
+    position: absolute; left: 2px; top: 1px;
+    font-size: 8px; opacity: 0.85; letter-spacing: 0.5px;
+  }
+  #stash-empty { color: var(--muted); text-align: center; margin-top: 30px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>gd-edit 存档查看器</h1>
+  <span id="status">加载中…</span>
+</header>
+<main>
+  <div id="list-pane">
+    <h2>公共仓库</h2>
+    <button id="stash-btn" class="char">公共仓库</button>
+    <h2>角色列表</h2>
+    <div id="char-list"></div>
+  </div>
+  <div id="detail-pane">
+    <div id="detail-empty">请在左侧选择一个角色或「公共仓库」</div>
+    <div id="detail" style="display:none">
+      <div class="char-title" id="char-name"></div>
+      <table id="attr-table"></table>
+    </div>
+    <div id="stash-view" style="display:none">
+      <div class="char-title">共享仓库</div>
+      <div id="stash-toolbar">
+        <div id="stash-modes">
+          <label>模式:
+            <select id="stash-mode">
+              <option value="standard">普通</option>
+              <option value="hardcore">专家</option>
+            </select>
+          </label>
+        </div>
+        <div id="stash-settings">
+          <label><input type="checkbox" id="opt-name" checked> 名称</label>
+          <label><input type="checkbox" id="opt-stack" checked> 叠堆数</label>
+          <label><input type="checkbox" id="opt-empty" checked> 空格底色</label>
+          <label><input type="checkbox" id="opt-rarity" checked> 稀有度着色</label>
+          <label><input type="checkbox" id="opt-rarity-text" checked> 稀有度文字</label>
+          <label>格子
+            <button class="small-btn" id="cell-dec">−</button>
+            <input type="number" id="cell-input" min="24" max="64" step="2" value="38">
+            <button class="small-btn" id="cell-inc">＋</button>
+          </label>
+        </div>
+      </div>
+      <div id="stash-tabs"></div>
+      <div id="stash-grid"></div>
+    </div>
+  </div>
+</main>
+<div id="error"></div>
+<div id="toast"></div>
+<script>
+"use strict";
+
+function $(id) { return document.getElementById(id); }
+
+function showError(msg) {
+  var el = $("error");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(function () { el.style.display = "none"; }, 4000);
+}
+
+function showToast(msg) {
+  var el = $("toast");
+  el.textContent = msg;
+  el.style.display = "block";
+  setTimeout(function () { el.style.display = "none"; }, 5000);
+}
+
+/* ---------- 角色列表 ---------- */
+function loadCharacters() {
+  fetch("/api/characters")
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      var list = data.characters || [];
+      var box = $("char-list");
+      box.innerHTML = "";
+      list.forEach(function (c) {
+        var btn = document.createElement("button");
+        btn.className = "char";
+        btn.textContent = c.name;
+        btn.dataset.path = c.path;
+        btn.addEventListener("click", function () {
+          document.querySelectorAll(".char.active").forEach(function (x) { x.classList.remove("active"); });
+          btn.classList.add("active");
+          showCharacter(c.path);
+        });
+        box.appendChild(btn);
+      });
+      $("status").textContent = "共 " + list.length + " 个角色";
+    })
+    .catch(function (e) { showError("加载角色列表失败: " + e.message); });
+}
+
+var currentPath = null;
+
+function renderIronNormal(td, span, btn) {
+  td.innerHTML = "";
+  td.appendChild(span);
+  td.appendChild(btn);
+}
+
+function saveMoney(saveBtn, span, btn, td, valueStr) {
+  var amount = parseInt(valueStr, 10);
+  if (isNaN(amount) || amount < 0 || amount > 2147483647) {
+    showError("请输入 0 ~ 2147483647 的整数");
+    return;
+  }
+  saveBtn.disabled = true;
+  fetch("/api/character/money", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: currentPath, amount: amount })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      if (data.ok) {
+        span.textContent = String(data.iron);
+        renderIronNormal(td, span, btn);
+        showToast("已保存，金钱 = " + data.iron + "（备份: " + data.backup + "）");
+      } else {
+        saveBtn.disabled = false;
+        showError("保存失败: " + (data.error || "未知错误"));
+      }
+    })
+    .catch(function (e) {
+      saveBtn.disabled = false;
+      showError("保存失败: " + e.message);
+    });
+}
+
+function buildIronCell(td, value) {
+  var span = document.createElement("span");
+  span.textContent = value;
+  var btn = document.createElement("button");
+  btn.className = "small-btn";
+  btn.textContent = "修改";
+  renderIronNormal(td, span, btn);
+  btn.addEventListener("click", function () {
+    td.innerHTML = "";
+    var input = document.createElement("input");
+    input.type = "number";
+    input.min = "0";
+    input.max = "2147483647";
+    input.step = "1";
+    input.value = String(span.textContent);
+    var saveBtn = document.createElement("button");
+    saveBtn.className = "small-btn primary";
+    saveBtn.textContent = "保存";
+    var cancelBtn = document.createElement("button");
+    cancelBtn.className = "small-btn";
+    cancelBtn.textContent = "取消";
+    td.appendChild(input);
+    td.appendChild(saveBtn);
+    td.appendChild(cancelBtn);
+    cancelBtn.addEventListener("click", function () {
+      renderIronNormal(td, span, btn);
+    });
+    saveBtn.addEventListener("click", function () {
+      saveMoney(saveBtn, span, btn, td, input.value);
+    });
+    input.focus();
+  });
+}
+
+function showCharacter(path) {
+  currentPath = path;
+  $("stash-view").style.display = "none";
+  fetch("/api/character?path=" + encodeURIComponent(path))
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      $("char-name").textContent = data.name;
+      var tbody = $("attr-table");
+      tbody.innerHTML = "";
+      (data.attributes || []).forEach(function (a) {
+        var tr = document.createElement("tr");
+        var tdL = document.createElement("td");
+        tdL.textContent = a.label;
+        tr.appendChild(tdL);
+        var tdV = document.createElement("td");
+        if (a.key === "iron") {
+          buildIronCell(tdV, a.value);
+        } else {
+          tdV.textContent = a.value;
+        }
+        tr.appendChild(tdV);
+        tbody.appendChild(tr);
+      });
+      $("detail-empty").style.display = "none";
+      $("detail").style.display = "block";
+    })
+    .catch(function (e) { showError("加载角色数据失败: " + e.message); });
+}
+
+/* ---------- 公共仓库 ---------- */
+var RARITY_COLORS = {
+  "Broken": "#8a8f98", "Common": "#e6e8ec", "Magical": "#4f9cf9",
+  "Rare": "#e6c14f", "Epic": "#b06ff2", "Legendary": "#ff8c1a", "Quest": "#4fd6c9"
+};
+var RARITY_TEXT = {
+  "Broken": "破损", "Common": "普通", "Magical": "魔法", "Rare": "稀有",
+  "Epic": "史诗", "Legendary": "传奇", "Quest": "任务"
+};
+
+var stashState = { mode: "standard", pages: [], cur: 0 };
+
+function pref(key, def) {
+  var v = localStorage.getItem(key);
+  return v === null ? def : v === "true";
+}
+
+function getCell() {
+  var c = parseInt(localStorage.getItem("gdw.cell"), 10);
+  return (isNaN(c) || c < 24 || c > 64) ? 38 : c;
+}
+
+function setCell(v) {
+  v = Math.max(24, Math.min(64, v));
+  localStorage.setItem("gdw.cell", String(v));
+  $("cell-input").value = String(v);
+  if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur].index);
+}
+
+function bindPref(id, key) {
+  $(id).checked = pref(key, true);
+  $(id).addEventListener("change", function () {
+    localStorage.setItem(key, $(id).checked ? "true" : "false");
+    if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur].index);
+  });
+}
+
+function loadStash() {
+  fetch("/api/stash?mode=" + stashState.mode)
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      stashState.pages = data.pages || [];
+      $("stash-mode").style.display = data["has-hardcore"] ? "" : "none";
+      renderStashTabs();
+      if (!stashState.pages.length) {
+        var g = $("stash-grid");
+        g.innerHTML = '<div id="stash-empty">共享仓库为空</div>';
+        $("status").textContent = "公共仓库 · 0 页";
+        return;
+      }
+      stashState.cur = 0;
+      loadStashPage(stashState.pages[0].index);
+    })
+    .catch(function (e) { showError("加载公共仓库失败: " + e.message); });
+}
+
+function renderStashTabs() {
+  var tabs = $("stash-tabs");
+  tabs.innerHTML = "";
+  stashState.pages.forEach(function (p, i) {
+    var b = document.createElement("button");
+    b.className = "tab-btn";
+    b.textContent = p.label + " · " + p.itemCount;
+    if (i === stashState.cur) b.classList.add("active");
+    b.addEventListener("click", function () {
+      stashState.cur = i;
+      renderStashTabs();
+      loadStashPage(p.index);
+    });
+    tabs.appendChild(b);
+  });
+}
+
+function loadStashPage(index) {
+  fetch("/api/stash/page?mode=" + stashState.mode + "&index=" + index)
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      $("status").textContent = "公共仓库 · " + stashState.pages.length + " 页";
+      renderStashGrid(data, index);
+    })
+    .catch(function (e) { showError("加载页面失败: " + e.message); });
+}
+
+function renderStashGrid(data, index) {
+  var grid = $("stash-grid");
+  var CELL = getCell();
+  grid.style.setProperty("--cell", CELL + "px");
+  grid.style.width = (data.width * CELL) + "px";
+  grid.style.height = (data.height * CELL) + "px";
+  grid.style.backgroundColor = pref("gdw.showEmpty", true)
+    ? "rgba(255,255,255,0.035)" : "transparent";
+  grid.innerHTML = "";
+  (data.items || []).forEach(function (it) {
+    var w = (it.w && it.w > 0) ? it.w : 1;
+    var h = (it.h && it.h > 0) ? it.h : 1;
+    var div = document.createElement("div");
+    div.className = "stash-item";
+    div.style.left = (it.x * CELL) + "px";
+    div.style.top = (it.y * CELL) + "px";
+    div.style.width = (w * CELL) + "px";
+    div.style.height = (h * CELL) + "px";
+    var rarity = it.rarity;
+    if (pref("gdw.showRarity", true) && rarity && RARITY_COLORS[rarity]) {
+      div.style.borderColor = RARITY_COLORS[rarity];
+    }
+    var nm = it.name || it.baseName || "?";
+    if (pref("gdw.showRarityText", true) && rarity && RARITY_TEXT[rarity]) {
+      var rt = document.createElement("span");
+      rt.className = "st-rarity";
+      rt.textContent = RARITY_TEXT[rarity];
+      div.appendChild(rt);
+    }
+    if (pref("gdw.showName", true) && it.name) {
+      var sn = document.createElement("span");
+      sn.className = "st-name";
+      sn.textContent = it.name;
+      div.appendChild(sn);
+    }
+    if (pref("gdw.showStack", true) && it.stackCount > 1) {
+      var sc = document.createElement("span");
+      sc.className = "st-count";
+      sc.textContent = "×" + it.stackCount;
+      div.appendChild(sc);
+    }
+    var tip = [nm];
+    if (it.prefixName) tip.push("前缀: " + it.prefixName);
+    if (it.suffixName) tip.push("后缀: " + it.suffixName);
+    if (rarity) tip.push("稀有度: " + (RARITY_TEXT[rarity] || rarity));
+    tip.push("坐标 (" + it.x + "," + it.y + ")");
+    tip.push("占地 " + (w === 1 && h === 1 ? "1×1" : w + "×" + h));
+    if (it.stackCount > 1) tip.push("叠堆 " + it.stackCount);
+    div.title = tip.join(" | ");
+    grid.appendChild(div);
+  });
+}
+
+bindPref("opt-name", "gdw.showName");
+bindPref("opt-stack", "gdw.showStack");
+bindPref("opt-empty", "gdw.showEmpty");
+bindPref("opt-rarity", "gdw.showRarity");
+bindPref("opt-rarity-text", "gdw.showRarityText");
+
+$("cell-input").value = String(getCell());
+
+$("stash-btn").addEventListener("click", function () {
+  document.querySelectorAll(".char.active").forEach(function (x) { x.classList.remove("active"); });
+  this.classList.add("active");
+  $("detail").style.display = "none";
+  $("detail-empty").style.display = "none";
+  $("stash-view").style.display = "block";
+  loadStash();
+});
+
+$("stash-mode").addEventListener("change", function () {
+  stashState.mode = this.value;
+  stashState.cur = 0;
+  loadStash();
+});
+
+$("cell-inc").addEventListener("click", function () { setCell(getCell() + 2); });
+$("cell-dec").addEventListener("click", function () { setCell(getCell() - 2); });
+$("cell-input").addEventListener("change", function () {
+  var v = parseInt(this.value, 10);
+  if (!isNaN(v) && v >= 24 && v <= 64) setCell(v);
+  else this.value = String(getCell());
+});
+
+loadCharacters();
+</script>
+</body>
+</html>
+

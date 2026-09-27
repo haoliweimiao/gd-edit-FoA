@@ -28,26 +28,92 @@
   [spec bb data context]
   (gdc/write-block bb data context spec))
 
+(defn- read-transfer-item!
+  [^ByteBuffer bb context]
+  (merge (s/read-struct gdc/Item-core bb context)
+         (gdc/read-item-tail-v13! bb context)
+         ;; GD 1.3+ (container version >= 11) stores X/Y as encrypted ints
+         ;; (same as personal stash items); older stash formats use raw floats.
+         (if (>= (or (:stash-container-version @context) 0) 11)
+           {:X (gdc/read-int!  bb context)
+            :Y (gdc/read-int!  bb context)}
+           {:X (.getFloat bb)
+            :Y (.getFloat bb)})))
+
+(defn- write-transfer-item!
+  [^ByteBuffer bb data context]
+  (s/write-struct gdc/Item-core bb data context)
+  (gdc/write-item-tail-v13! bb data context)
+  (if (>= (or (:stash-container-version @context) 0) 11)
+    (do (gdc/write-int! bb (:X data) context)
+        (gdc/write-int! bb (:Y data) context))
+    (do (.putFloat bb (float (:X data)))
+        (.putFloat bb (float (:Y data))))))
+
 (def TransferStashItem
-  (into gdc/Item
-        (s/struct-def
-         :X :float
-         :Y :float)))
+  (with-meta
+    (into gdc/Item-core
+          (s/struct-def
+           :X :int32
+           :Y :int32))
+    {:struct/read  read-transfer-item!
+     :struct/write write-transfer-item!}))
 
 (def InventorySack
   (s/struct-def
    :width           :int32
    :height          :int32
-   :inventory-items (s/array TransferStashItem)))
+   :inventory-items (s/array TransferStashItem)
 
-(def Block18
+   ;; GD 1.3 / FoA: per-tab border/symbol/label (same shape as character
+   ;; stash Block4/Stash). Present at block18 container version >= 9.
+   :border-index       (s/conditional (fn [_ context]
+                                        (when (>= (or (:stash-container-version @context) 0) 9)
+                                          :int32)))
+   :border-color-index (s/conditional (fn [_ context]
+                                        (when (>= (or (:stash-container-version @context) 0) 9)
+                                          :int32)))
+   :symbol-index       (s/conditional (fn [_ context]
+                                        (when (>= (or (:stash-container-version @context) 0) 9)
+                                          :int32)))
+   :symbol-color-index (s/conditional (fn [_ context]
+                                        (when (>= (or (:stash-container-version @context) 0) 9)
+                                          :int32)))
+   :button-name        (s/conditional (fn [_ context]
+                                        (when (>= (or (:stash-container-version @context) 0) 9)
+                                          (s/string :utf-16-le))))))
+
+;; The stash array carries its own :int32 length prefix (handled by s/array),
+;; followed by `stash-count` sub-blocks of id 0 (InventorySack). HEAD read only
+;; up to the version here; keep the structured read but make sure the container
+;; version is set on the context first so the item tail + per-tab conditionals
+;; below can branch on it.
+(def ^:private Block18-inner
   (s/struct-def
-   :version   :int32
    :unknown   :int32-
    :mod       (s/string :ascii)
    :expansion-status :byte
    :stash     (s/array
                (struct-block {0 InventorySack}))))
+
+(defn- read-block18!
+  [^ByteBuffer bb context]
+  (let [version (gdc/read-int! bb context)
+        _ (swap! context assoc :stash-container-version version)]
+    (assoc (s/read-struct Block18-inner bb context)
+           :version version)))
+
+(defn- write-block18!
+  [^ByteBuffer bb data context]
+  (let [version (:version data)]
+    (gdc/write-int! bb version context)
+    (swap! context assoc :stash-container-version version)
+    (s/write-struct Block18-inner bb data context)))
+
+(def Block18
+  (s/struct-def
+   {:struct/read  read-block18!
+    :struct/write write-block18!}))
 
 ;; The transfer stash file seem to have a
 (defn make-enc-context

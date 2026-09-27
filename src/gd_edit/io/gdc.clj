@@ -123,36 +123,120 @@
    :relic-completion-level :int32
    :stack-count            :int32))
 
-;; GD 1.3.0+ (Fangs of Asterkarn) appends four int32 fields after stack-count on
-;; character inventory/equipment/personal-stash items (block 3/4 version 11).
-;; Names are provisional; related transfer-stash v8+ fields in Item Assistant are
-;; AscendantRecord / AscendantRecord2H / Rerolls (different layout — see stash.clj).
-(def Item-v13-fields
+;; GD 1.3.0+ (Fangs of Asterkarn) changes the tail of character inventory /
+;; equipment / personal-stash items (block 3/4 version 11). Instead of the old
+;; two int32s (relic-completion-level, stack-count), version 11+ items carry:
+;;
+;;   augmented-ascendant (str), augmented-ascendant-2h (str),
+;;   materia-combines (int), stack-count (int), rerolls (int), v11-extra (int)
+;;
+;; Layout beyond augment-seed was verified against a real GD 1.3 FoA save
+;; (byte-aligned boundaries on _purple/player.gdc; see probes 30/33).
+;;
+;; IMPORTANT: these fields only exist on block 3/4 version 11+ (GD 1.3.0+).
+;; Earlier versions (e.g. 4) keep the old two-int tail. Version is smuggled in
+;; via the context (see read-block3 / read-block4).
+;;
+;; The transfer stash (stash.clj) reuses `Item` directly with its own layout and
+;; does not set an inventory version, so it keeps the old tail — leave `Item`
+;; untouched and add the version-tail only to the concrete structs below.
+(defn- item-v13?
+  [_ context]
+  (let [version (or (:item-version @context) (:stash-container-version @context) 0)]
+    (>= version 11)))
+
+(def Item-core
   (s/struct-def
-   :13-unk1 :int32
-   :13-unk2 :int32
-   :13-unk3 :int32
-   :13-unk4 :int32))
+   :basename       (s/string :ascii)
+   :prefix-name    (s/string :ascii)
+   :suffix-name    (s/string :ascii)
+   :modifier-name  (s/string :ascii)
+   :transmute-name (s/string :ascii)
+   :seed           :int32
+
+   :relic-name     (s/string :ascii)
+   :relic-bonus    (s/string :ascii)
+   :relic-seed     :int32
+
+   :augment-name   (s/string :ascii)
+   :unknown        :int32
+   :augment-seed   :int32))
+
+(defn read-item-tail-v13!
+  [^ByteBuffer bb context]
+  (if (item-v13? nil context)
+    {:ascendant           (read-string! bb context)
+     :ascendant2h         (read-string! bb context)
+     :materia-combines    (read-int!  bb context)
+     :stack-count         (read-int!  bb context)
+     :rerolls             (read-int!  bb context)
+     :v11-extra           (read-int!  bb context)}
+    {:relic-completion-level (read-int! bb context)
+     :stack-count            (read-int! bb context)}))
+
+(defn write-item-tail-v13!
+  [^ByteBuffer bb data context]
+  (if (item-v13? nil context)
+    (do (write-string! bb (:ascendant        data) context)
+        (write-string! bb (:ascendant2h      data) context)
+        (write-int!    bb (:materia-combines data) context)
+        (write-int!    bb (:stack-count      data) context)
+        (write-int!    bb (:rerolls          data) context)
+        (write-int!    bb (:v11-extra        data) context))
+    (do (write-int! bb (:relic-completion-level data) context)
+        (write-int! bb (:stack-count            data) context))))
+
+(defn- read-inventory-item!
+  [^ByteBuffer bb context]
+  (merge (s/read-struct Item-core bb context)
+         (read-item-tail-v13! bb context)
+         {:X (read-int! bb context)
+          :Y (read-int! bb context)}))
+
+(defn- write-inventory-item!
+  [^ByteBuffer bb data context]
+  (s/write-struct Item-core bb data context)
+  (write-item-tail-v13! bb data context)
+  (write-int! bb (:X data) context)
+  (write-int! bb (:Y data) context))
+
+(defn- read-equipment-item!
+  [^ByteBuffer bb context]
+  (merge (s/read-struct Item-core bb context)
+         (read-item-tail-v13! bb context)
+         {:attached (read-bool! bb context)}))
+
+(defn- write-equipment-item!
+  [^ByteBuffer bb data context]
+  (s/write-struct Item-core bb data context)
+  (write-item-tail-v13! bb data context)
+  (write-bool! bb (:attached data) context))
 
 (def InventoryItem
-  (into Item
-        (into Item-v13-fields
-              (s/struct-def
-               :X :int32
-               :Y :int32))))
+  (with-meta
+    (into Item-core
+          (s/struct-def
+           :X :int32
+           :Y :int32))
+    {:struct/read  read-inventory-item!
+     :struct/write write-inventory-item!}))
 
 (def StashItem
-  (into Item
-        (into Item-v13-fields
-              (s/struct-def
-               :X :int32
-               :Y :int32))))
+  (with-meta
+    (into Item-core
+          (s/struct-def
+           :X :int32
+           :Y :int32))
+    {:struct/read  read-inventory-item!
+     :struct/write write-inventory-item!}))
 
 (def EquipmentItem
-  (into Item
-        (into Item-v13-fields
-              (s/struct-def
-               :attached :bool))))
+  (with-meta
+    (into Item-core
+          (s/struct-def
+           :attached :bool))
+    {:struct/read  read-equipment-item!
+     :struct/write write-equipment-item!}))
 
 
 (def InventorySack
@@ -165,6 +249,7 @@
   [^ByteBuffer bb context]
 
   (let [version (read-int! bb context)
+        _ (swap! context assoc :item-version version)
         has-data (read-bool! bb context)]
     (if-not has-data
       {:version           version
@@ -214,6 +299,7 @@
   [^ByteBuffer bb block context]
 
   (write-int! bb (:version block) context)
+  (swap! context assoc :item-version (:version block))
   (write-bool! bb (:has-data block) context)
 
   (when (:has-data block)
@@ -363,7 +449,9 @@
    :level                    :int32
    :enabled                  :bool
    ;; GD 1.3 / block8 version 8+: extra flag after enabled
-   :8-skill-unk              :bool
+   :8-skill-unk              (s/conditional (fn [_ context]
+                                              (when (>= (or (:block8-version @context) 0) 8)
+                                                :bool)))
    :devotion-level           :int32
    :devotion-experience      :int32
    :sublevel                 :int32
@@ -380,17 +468,47 @@
    :unknown-bytes            (s/string :ascii :length 4)
    :unknown                  (s/string :ascii)))
 
-(def Block8
-  (s/struct-def
-   :version :int32
+(defn- ^:private read-block8
+  [^ByteBuffer bb context]
+  (let [version (read-int! bb context)
+        _ (swap! context assoc :block8-version version)
+        skills (s/read-struct (s/array CharacterSkill) bb context)
+        masteries-allowed (read-int! bb context)
+        skill-points-reclaimed (read-int! bb context)
+        devotion-points-reclaimed (read-int! bb context)
+        item-skills (s/read-struct (s/array ItemSkill) bb context)
+        unk1 (when (>= version 6) (read-int! bb context))]
+    {:version version
+     :skills skills
+     :masteries-allowed masteries-allowed
+     :skill-points-reclaimed skill-points-reclaimed
+     :devotion-points-reclaimed devotion-points-reclaimed
+     :item-skills item-skills
+     :8-unk1 unk1}))
 
-   :skills                     (s/array CharacterSkill)
-   :masteries-allowed          :int32
-   :skill-points-reclaimed     :int32
-   :devotion-points-reclaimed  :int32
-   :item-skills                (s/array ItemSkill)
-   :8-unk1                     (after-block-version 6 :int32)
-   {:anchor true}))
+(defn- ^:private write-block8
+  [^ByteBuffer bb block context]
+  (let [version (:version block)
+        skills (:skills block)
+        masteries-allowed (:masteries-allowed block)
+        skill-points-reclaimed (:skill-points-reclaimed block)
+        devotion-points-reclaimed (:devotion-points-reclaimed block)
+        item-skills (:item-skills block)
+        unk1 (:8-unk1 block)]
+    (swap! context assoc :block8-version version)
+    (write-int! bb version context)
+    (s/write-struct (s/array CharacterSkill) bb skills context)
+    (write-int! bb masteries-allowed context)
+    (write-int! bb skill-points-reclaimed context)
+    (write-int! bb devotion-points-reclaimed context)
+    (s/write-struct (s/array ItemSkill) bb item-skills context)
+    (when (>= version 6)
+      (write-int! bb unk1 context))))
+
+(def Block8
+  (with-meta (s/struct-def)
+    {:struct/read read-block8
+     :struct/write write-block8}))
 
 (def Block12
   (s/struct-def
@@ -496,9 +614,11 @@
                                    (= version 4)
                                    (s/array HotSlot :length 36)
 
-                                   ;; GD 1.3 / FoA: expanded hotbar (controller + dual-class pages)
+                                   ;; Version 7+ grows the hotbar to 47 slots. Verified against both
+                                   ;; a pre-1.3 and a GD 1.3 FoA save (both carry block14 version 7);
+                                   ;; the block length assertion holds only with 47 (46/95 both fail).
                                    (>= version 7)
-                                   (s/array HotSlot :length 95)
+                                   (s/array HotSlot :length 47)
 
                                    :else
                                    (s/array HotSlot :length 46)))))

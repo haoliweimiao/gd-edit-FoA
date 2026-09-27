@@ -1,0 +1,24 @@
+#!/bin/bash
+# gd-edit Web 查看器启动脚本：配置 Java 11 + Clojure 环境，启动 Web 服务器并自动打开浏览器。
+# 用法:
+#   ./scripts/web
+
+set -euo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+# ---- 配置运行环境 ----
+# 切换 Java 11（gd-edit 需要 64 位 JVM，11 已验证可用）
+if [ -n "${JAVA_HOME_11:-}" ]; then
+    export JAVA_HOME="$JAVA_HOME_11"
+    export PATH="$JAVA_HOME/bin:$PATH"
+fi
+
+# Clojure CLI（若已安装则无需）
+if [ -x "/home/von/library/clojure/bin/clojure" ]; then
+    export PATH="/home/von/library/clojure/bin:$PATH"
+fi
+
+cd "$REPO_DIR"
+
+clojure -M -m gd-edit.web.main "$@"

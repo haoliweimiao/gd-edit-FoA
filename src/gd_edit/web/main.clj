@@ -1,0 +1,406 @@
+(ns gd-edit.web.main
+  (:gen-class)
+  (:require [clojure.data.json :as json]
+            [clojure.java.io :as io]
+            [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [gd-edit.app-util :as au]
+            [gd-edit.db-utils :as dbu]
+            [gd-edit.game-dirs :as dirs]
+            [gd-edit.globals :as globals]
+            [gd-edit.inventory :as inv]
+            [gd-edit.io.arc :as arc]
+            [gd-edit.io.arz :as arz]
+            [gd-edit.io.gdc :as gdc]
+            [gd-edit.io.stash :as st]
+            [gd-edit.utils :as u])
+  (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
+           [java.net InetSocketAddress URLDecoder]
+           [java.nio.charset StandardCharsets]))
+
+(def ^:private port 8787)
+(def ^:private base-url (str "http://127.0.0.1:" port))
+(def ^:private local-table (atom {}))
+(def ^:private page-html (atom nil))
+
+(def ^:private loc-files
+  ["resources/Text_EN.arc"
+   "gdx1/resources/Text_EN.arc"
+   "gdx2/resources/Text_EN.arc"
+   "gdx3/resources/Text_EN.arc"])
+
+(defn- load-local-table!
+  "载入游戏语言词表用于解析名称 tag，失败时静默降级为空表。"
+  []
+  (try
+    (reset! local-table
+            (->> (map #(io/file (dirs/get-game-dir) %) loc-files)
+                 (filter #(.isFile %))
+                 (map arc/load-localization-table)
+                 (apply merge {})))
+    (catch Throwable _ (reset! local-table {}))))
+
+(defn- page-html!
+  []
+  (when (nil? @page-html)
+    (reset! page-html (slurp (io/resource "web/index.html"))))
+  @page-html)
+
+(defn- resolve-tag
+  [v]
+  (if (and (string? v) (str/starts-with? v "tag"))
+    (get @local-table (first (str/split v #"\|")) v)
+    v))
+
+(defn- resolve-tokens
+  "把名称字符串里的 tag 词条逐词本地化（兜底：非 tag 原样保留）。"
+  [s]
+  (if (and s (not (str/blank? s)))
+    (->> (str/split s #"\s+")
+         (map resolve-tag)
+         (str/join " "))
+    s))
+
+(defn- fmt-playtime
+  [secs]
+  (let [h (quot secs 3600)
+        m (quot (mod secs 3600) 60)
+        s (mod secs 60)]
+    (format "%02d:%02d:%02d" h m s)))
+
+(def ^:private display-fields
+  [["角色名" :character-name identity]
+   ["职业" :player-class-name resolve-tag]
+   ["性别" :male (fn [v] (if v "男" "女"))]
+   ["等级" :character-level str]
+   ["硬核模式" :hardcore-mode (fn [v] (if v "是" "否"))]
+   ["金钱 (铁币)" :iron str]
+   ["经验" :experience str]
+   ["属性点" :attribute-points str]
+   ["技能点" :skill-points str]
+   ["虔诚点" :devotion-points str]
+   ["体格" :physique pr-str]
+   ["灵巧" :cunning pr-str]
+   ["心智" :spirit pr-str]
+   ["生命" :health pr-str]
+   ["能量" :energy pr-str]
+   ["游玩时间" :playtime-seconds fmt-playtime]
+   ["死亡次数" :death-count str]
+   ["击杀数" :kill-count str]])
+
+(defn- characters-payload
+  []
+  {:characters
+   (->> (au/character-list)
+        (sort-by :character-name)
+        (mapv (fn [c] {:name (:character-name c)
+                       :path (:gdc-path c)})))})
+
+(defn- character-payload
+  [path]
+  (let [c (gdc/load-character-file path)
+        attrs (mapv (fn [[label k fmt]]
+                      (let [v (get c k)]
+                        {:key (name k)
+                         :label label
+                         :value (if (nil? v) "" (fmt v))}))
+                    display-fields)]
+    {:name (:character-name c)
+     :path path
+     :attributes attrs}))
+
+(declare send-json!)
+
+(def ^:private int32-max 2147483647)
+
+(defn- valid-amount?
+  [a]
+  (and (integer? a) (<= 0 a int32-max)))
+
+(defn- backup-copy!
+  "按 CLI 约定把档案备份为 .bak{N}（递增），返回备份路径。"
+  [filepath]
+  (let [f (io/file filepath)
+        filename (.getName f)
+        siblings (->> (.listFiles (.getParentFile f))
+                      (filter #(.isFile %))
+                      (filter #(str/starts-with? (.getName %) filename))
+                      (filter #(re-matches #"\.bak.*$" (subs (.getName %) (count filename)))))
+        backup-path (str filepath ".bak" (inc (count siblings)))]
+    (io/copy f (io/file backup-path))
+    backup-path))
+
+(defn- write-money!
+  [path amount]
+  (let [backup (backup-copy! path)
+        c (gdc/load-character-file path)]
+    (gdc/write-character-file (assoc c :iron amount) path)
+    (let [actual (get (gdc/load-character-file path) :iron)]
+      (if (= actual amount)
+        {:ok true :iron actual :backup backup}
+        (throw (ex-info "写入校验失败" {:expected amount :actual actual}))))))
+
+(defn- request-body
+  [exchange]
+  (slurp (.getRequestBody exchange)))
+
+(defn- money-request-payload
+  [exchange]
+  (try
+    (json/read-str (request-body exchange) :key-fn keyword)
+    (catch Throwable _ nil)))
+
+(defn- handle-money-post
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        amount (:amount body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (valid-amount? amount))
+      (send-json! exchange 400 {:ok false :error "金额必须是 0 ~ 2147483647 的整数"})
+
+      :else
+      (try
+        (send-json! exchange 200 (write-money! path amount))
+        (catch Throwable e
+          (send-json! exchange 500 {:ok false :error (str e)}))))))
+
+
+;;------------------------------------------------------------------------------
+;; 公共仓库（只读查看）
+;;------------------------------------------------------------------------------
+
+(defn- stash-save-root
+  []
+  (->> (dirs/get-save-dir-search-list)
+       (map #(.getParentFile (io/file %)))
+       (map str)
+       first))
+
+(def ^:private gdx3-loaded (atom false))
+
+(defn- ensure-gdx3-loaded!
+  "基础 DB/贴图覆盖目录不含 GDX3（FoA）。此处补充 GDX3 记录与贴图尺寸，
+  使 gdx3 物品也能解析出名称、稀有度与真实占格。"
+  []
+  (when-not @gdx3-loaded
+    (locking gdx3-loaded
+      (when-not @gdx3-loaded
+        (let [gdx3-db (io/file (dirs/get-game-dir) "gdx3/database/GDX3.arz")
+              gdx3-tex (io/file (dirs/get-game-dir) "gdx3/resources/Items.arc")]
+          ;; 等待基础 DB（含本地化）加载完成
+          ;; globals/db 等根值为 future；全库用 @ 读取，须保持 IDeref(future) 语义，
+          ;; 因此以「新 future 把 gdx3 合并进基础数据」替代根值。
+          @globals/db-and-index
+          (when (.isFile gdx3-db)
+            (let [extra (arz/load-game-db (str gdx3-db) @globals/localization-table)]
+              (when (seq extra)
+                (let [extra-idx (au/build-db-index extra)]
+                  (alter-var-root #'globals/db (fn [f] (future (concat @f extra))))
+                  (alter-var-root #'globals/db-index (fn [f] (future (merge @f extra-idx))))
+                  (alter-var-root #'globals/db-and-index (fn [f] (future (au/build-db-and-index))))))))
+          (when (.isFile gdx3-tex)
+            (alter-var-root #'inv/texture-dim-fns
+                            (fn [fns] (concat fns (map inv/make-dims-lookup-fn [gdx3-tex]))))
+            (reset! inv/texture-dim-cache (inv/make-cache))))
+        (reset! gdx3-loaded true))))
+  nil)
+
+(defn- stash-file-path
+  [mode]
+  (str (io/file (stash-save-root)
+                (if (= mode "hardcore") "transfer.gsh" "transfer.gst"))))
+
+(defn- slot-coord
+  "v11 公共仓库的 X/Y 为 IEEE 浮点位模式；合法浮点坐标按 float 解释，否则回退整数。"
+  [bits]
+  (let [f (Float/intBitsToFloat (int bits))]
+    (if (and (>= f 0) (< f 64) (== f (Math/floor f)))
+      f
+      bits)))
+
+(defn- item-rarity
+  [basename]
+  (when-let [rec (get (dbu/db-recordname-index) basename)]
+    (get rec "itemClassification")))
+
+(defn- stash-item-dims
+  [item]
+  (try
+    (inv/item->dims item)
+    (catch Throwable _ nil)))
+
+(defn- stash-items-payload
+  [sack]
+  (let [items (:inventory-items sack)]
+    (mapv (fn [idx it]
+            (let [nm (try (dbu/item-name it) (catch Throwable _ nil))]
+              {:slot idx
+               :name (resolve-tokens nm)
+               :baseName (:basename it)
+               :stackCount (:stack-count it)
+               :x (slot-coord (:X it))
+               :y (slot-coord (:Y it))
+               :w (:width (stash-item-dims it))
+               :h (:height (stash-item-dims it))
+               :rarity (item-rarity (:basename it))
+               :prefixName (resolve-tokens (:prefix-name it))
+               :suffixName (resolve-tokens (:suffix-name it))}))
+          (range)
+          items)))
+
+(defn- stash-payload
+  [mode]
+  (let [path (stash-file-path mode)
+        s (st/load-stash-file path)]
+    {:exists true
+     :mode mode
+     :file path
+     :has-hardcore (.isFile (io/file (stash-file-path "hardcore")))
+     :pages (->> (:stash s)
+                 (map-indexed
+                  (fn [idx sack]
+                    {:index idx
+                     :label (if (str/blank? (:button-name sack))
+                              (str "第 " (inc idx) " 页")
+                              (:button-name sack))
+                     :width (:width sack)
+                     :height (:height sack)
+                     :itemCount (count (:inventory-items sack))}))
+                 (vec))}))
+
+(defn- stash-page-payload
+  [mode index]
+  (ensure-gdx3-loaded!)
+  (let [s (st/load-stash-file (stash-file-path mode))
+        sack (nth (:stash s) index nil)]
+    (when sack
+      {:width (:width sack)
+       :height (:height sack)
+       :items (stash-items-payload sack)})))
+
+(defn- parse-query-param
+  [query key]
+  (->> (str/split (or query "") #"&")
+       (keep (fn [kv]
+               (let [[k v] (str/split kv #"=" 2)]
+                 (when (= k key)
+                   (URLDecoder/decode (or v "") "UTF-8")))))
+        first))
+
+(defn- parse-int-param
+  [query key default]
+  (let [raw (parse-query-param query key)]
+    (if raw
+      (try (Integer/parseInt raw) (catch Throwable _ nil))
+      default)))
+
+(defn- send!
+  [exchange status body content-type]
+  (let [bytes (.getBytes body StandardCharsets/UTF_8)]
+    (.sendResponseHeaders exchange status (long (alength bytes)))
+    (when (pos? (alength bytes))
+      (with-open [os (.getResponseBody exchange)]
+        (.write os bytes)))))
+
+(defn- send-json!
+  [exchange status data]
+  (send! exchange status (json/write-str data) "application/json; charset=utf-8"))
+
+(defn- send-html!
+  [exchange status html]
+  (send! exchange status html "text/html; charset=utf-8"))
+
+(defn- handle-request
+  [exchange]
+  (try
+    (let [uri (.getRequestURI exchange)
+          path (.getPath uri)
+          query (.getRawQuery uri)
+          method (.getRequestMethod exchange)]
+      (cond
+        (= path "/")
+        (send-html! exchange 200 (page-html!))
+
+        (= path "/api/characters")
+        (send-json! exchange 200 (characters-payload))
+
+        (and (= path "/api/character") query)
+        (send-json! exchange 200
+                    (character-payload (parse-query-param query "path")))
+
+        (and (= path "/api/character/money") (= method "POST"))
+        (handle-money-post exchange)
+
+        (= path "/api/character/money")
+        (send-json! exchange 405 {:error "method not allowed"})
+
+        (and (= path "/api/stash")
+             (or (nil? query) (not (str/includes? query "index"))))
+        (let [mode (or (parse-query-param query "mode") "standard")]
+          (if (.isFile (io/file (stash-file-path mode)))
+            (send-json! exchange 200 (stash-payload mode))
+            (send-json! exchange 404 {:error (str "未找到共享仓库文件: " (stash-file-path mode))})))
+
+        (and (= path "/api/stash/page") query)
+        (let [mode (or (parse-query-param query "mode") "standard")
+              index (parse-int-param query "index" nil)]
+          (cond
+            (nil? index)
+            (send-json! exchange 400 {:error "缺少合法的 index 参数"})
+
+            (not (.isFile (io/file (stash-file-path mode))))
+            (send-json! exchange 404 {:error (str "未找到共享仓库文件: " (stash-file-path mode))})
+
+            :else
+            (if-let [data (stash-page-payload mode index)]
+              (send-json! exchange 200 data)
+              (send-json! exchange 404 {:error (str "页不存在: " index)}))))
+
+        :else
+        (send-json! exchange 404 {:error "not found"})))
+    (catch Throwable e
+      (send-json! exchange 500 {:error (str e)}))
+    (finally
+      (.close exchange))))
+
+(defn- open-browser
+  []
+  (future
+    (try
+      (if (u/running-windows?)
+        (shell/sh "cmd" "/c" "start" base-url)
+        (shell/sh "xdg-open" base-url))
+      (catch Throwable _
+        nil))))
+
+(defn -main
+  [& _args]
+  (au/load-settings-file)
+  (load-local-table!)
+  (au/load-db-in-background)
+  (try
+    (let [server (HttpServer/create (InetSocketAddress. port) 0)]
+      (.setExecutor server (java.util.concurrent.Executors/newCachedThreadPool))
+      (.createContext server "/"
+                      (reify HttpHandler
+                        (handle [_ exchange] (handle-request exchange))))
+      (.start server)
+      (println (str "gd-edit Web 已启动: " base-url))
+      (println (str "角色数据目录: " (dirs/get-save-dir-search-list)))
+      (open-browser)
+      (.addShutdownHook (Runtime/getRuntime)
+                        (Thread. (fn [] (try (.stop server 0) (catch Throwable _ nil)))))
+      @(promise))
+    (catch java.net.BindException _
+      (binding [*out* *err*]
+        (println (str "端口 " port " 已被占用，请先关闭占用进程或修改端口。"))))
+    (catch Throwable e
+      (binding [*out* *err*]
+        (println (str "启动失败: " e))))))
