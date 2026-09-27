@@ -20,25 +20,66 @@
 
 (def ^:private port 8787)
 (def ^:private base-url (str "http://127.0.0.1:" port))
-(def ^:private local-table (atom {}))
+(def ^:private local-en (atom {}))
+(def ^:private local-zh (atom {}))
+(def ^:private local-zh-merged (atom {}))
 (def ^:private page-html (atom nil))
 
-(def ^:private loc-files
+(def ^:private en-files
   ["resources/Text_EN.arc"
    "gdx1/resources/Text_EN.arc"
    "gdx2/resources/Text_EN.arc"
    "gdx3/resources/Text_EN.arc"])
 
-(defn- load-local-table!
-  "载入游戏语言词表用于解析名称 tag，失败时静默降级为空表。"
-  []
+(def ^:private zh-files
+  ["resources/Text_ZH.arc"
+   "gdx1/resources/Text_ZH.arc"
+   "gdx2/resources/Text_ZH.arc"
+   "gdx3/resources/Text_ZH.arc"])
+
+(defn- load-lang-table!
+  [files]
   (try
-    (reset! local-table
-            (->> (map #(io/file (dirs/get-game-dir) %) loc-files)
-                 (filter #(.isFile %))
-                 (map arc/load-localization-table)
-                 (apply merge {})))
-    (catch Throwable _ (reset! local-table {}))))
+    (->> (map #(io/file (dirs/get-game-dir) %) files)
+         (filter #(.isFile %))
+         (map arc/load-localization-table)
+         (apply merge {}))
+    (catch Throwable _ {})))
+
+(defn- load-txt-l10n-map
+  "加载游戏 Settings/text_zh/*.txt 明文汉化覆盖表（游戏内实际生效的社区汉化）。
+  条目格式 key=value（UTF-8，可含 BOM/CR），空值与 # 注释行跳过。"
+  [root]
+  (try
+    (let [root-file (io/file root)]
+      (when (.isDirectory root-file)
+        (->> (file-seq root-file)
+             (filter (fn [f] (and (.isFile f) (str/ends-with? (.getName f) ".txt"))))
+             (reduce (fn [m f]
+                       (into m
+                             (keep (fn [ln]
+                                     (let [l (str/trim (str/replace (str/replace ln #"^\uFEFF" "")
+                                                                     #"\r$" ""))]
+                                       (when (and (seq l)
+                                                  (not (str/starts-with? l "#"))
+                                                  (str/includes? l "="))
+                                         (let [[k v] (str/split l #"=" 2)]
+                                           [(str/trim k) (str/trim (or v ""))]))))
+                                   (str/split-lines (slurp f :encoding "UTF-8")))))
+                     {}))))
+    (catch Throwable _ {})))
+
+(defn- load-local-table!
+  "载入游戏英/中词表用于解析名称 tag，失败时静默降级为空表。
+  中文合并时跳过空串条目：中文包未翻译（空值）的词条回退英文。"
+  []
+  (reset! local-en (load-lang-table! en-files))
+  (reset! local-zh (merge (load-lang-table! zh-files)
+                          (load-txt-l10n-map (str (io/file (dirs/get-game-dir)
+                                                           "Settings/text_zh")))))
+  (reset! local-zh-merged
+          (merge @local-en
+                 (into {} (remove (fn [[_ v]] (str/blank? v))) @local-zh))))
 
 (defn- page-html!
   []
@@ -47,19 +88,26 @@
   @page-html)
 
 (defn- resolve-tag
-  [v]
+  [v table]
   (if (and (string? v) (str/starts-with? v "tag"))
-    (get @local-table (first (str/split v #"\|")) v)
+    (get table (first (str/split v #"\|")) v)
     v))
 
 (defn- resolve-tokens
   "把名称字符串里的 tag 词条逐词本地化（兜底：非 tag 原样保留）。"
-  [s]
+  [s table]
   (if (and s (not (str/blank? s)))
     (->> (str/split s #"\s+")
-         (map resolve-tag)
+         (map #(resolve-tag % table))
          (str/join " "))
     s))
+
+(defn- lang-table
+  "返回指定语言词表：zh 为中文（未翻译词条回退英文）；其余返回英文表。"
+  [lang]
+  (if (= lang "zh")
+    @local-zh-merged
+    @local-en))
 
 (defn- fmt-playtime
   [secs]
@@ -97,13 +145,17 @@
                        :path (:gdc-path c)})))})
 
 (defn- character-payload
-  [path]
+  [path lang]
   (let [c (gdc/load-character-file path)
+        table (lang-table lang)
         attrs (mapv (fn [[label k fmt]]
                       (let [v (get c k)]
                         {:key (name k)
                          :label label
-                         :value (if (nil? v) "" (fmt v))}))
+                         :value (if (nil? v) ""
+                                  (if (= k :player-class-name)
+                                    (resolve-tag v table)
+                                    (fmt v)))}))
                     display-fields)]
     {:name (:character-name c)
      :path path
@@ -236,13 +288,29 @@
     (inv/item->dims item)
     (catch Throwable _ nil)))
 
+(defn- affix-name
+  "把词缀 dbr 路径映射为 DB 中记录的显示名（lootRandomizerName），
+  与游戏内一致；无法解析时保留原值。"
+  [path]
+  (if (and path (not (str/blank? path)))
+    (if-let [rec (get @globals/db-index path)]
+      (let [nm (str (get rec "lootRandomizerName"))]
+        (if (str/blank? nm) path nm))
+      path)
+    path))
+
+(defn- strip-color-codes
+  "去除 GD 文本颜色码（如 ^g/^y/^l）残留。"
+  [s]
+  (when s (str/replace s #"\^[A-Za-z]" "")))
+
 (defn- stash-items-payload
-  [sack]
+  [sack table]
   (let [items (:inventory-items sack)]
     (mapv (fn [idx it]
             (let [nm (try (dbu/item-name it) (catch Throwable _ nil))]
               {:slot idx
-               :name (resolve-tokens nm)
+               :name (strip-color-codes (resolve-tokens nm table))
                :baseName (:basename it)
                :stackCount (:stack-count it)
                :x (slot-coord (:X it))
@@ -250,8 +318,8 @@
                :w (:width (stash-item-dims it))
                :h (:height (stash-item-dims it))
                :rarity (item-rarity (:basename it))
-               :prefixName (resolve-tokens (:prefix-name it))
-               :suffixName (resolve-tokens (:suffix-name it))}))
+               :prefixName (strip-color-codes (affix-name (:prefix-name it)))
+               :suffixName (strip-color-codes (affix-name (:suffix-name it)))}))
           (range)
           items)))
 
@@ -276,14 +344,15 @@
                  (vec))}))
 
 (defn- stash-page-payload
-  [mode index]
+  [mode index lang]
   (ensure-gdx3-loaded!)
   (let [s (st/load-stash-file (stash-file-path mode))
-        sack (nth (:stash s) index nil)]
+        sack (nth (:stash s) index nil)
+        table (lang-table lang)]
     (when sack
       {:width (:width sack)
        :height (:height sack)
-       :items (stash-items-payload sack)})))
+       :items (stash-items-payload sack table)})))
 
 (defn- parse-query-param
   [query key]
@@ -333,7 +402,8 @@
 
         (and (= path "/api/character") query)
         (send-json! exchange 200
-                    (character-payload (parse-query-param query "path")))
+                    (character-payload (parse-query-param query "path")
+                                       (or (parse-query-param query "lang") "zh")))
 
         (and (= path "/api/character/money") (= method "POST"))
         (handle-money-post exchange)
@@ -350,7 +420,8 @@
 
         (and (= path "/api/stash/page") query)
         (let [mode (or (parse-query-param query "mode") "standard")
-              index (parse-int-param query "index" nil)]
+              index (parse-int-param query "index" nil)
+              lang (or (parse-query-param query "lang") "zh")]
           (cond
             (nil? index)
             (send-json! exchange 400 {:error "缺少合法的 index 参数"})
@@ -359,7 +430,7 @@
             (send-json! exchange 404 {:error (str "未找到共享仓库文件: " (stash-file-path mode))})
 
             :else
-            (if-let [data (stash-page-payload mode index)]
+            (if-let [data (stash-page-payload mode index lang)]
               (send-json! exchange 200 data)
               (send-json! exchange 404 {:error (str "页不存在: " index)}))))
 
@@ -384,7 +455,7 @@
   [& _args]
   (au/load-settings-file)
   (load-local-table!)
-  (au/load-db-in-background)
+  (au/load-db-in-background @local-zh-merged)
   (try
     (let [server (HttpServer/create (InetSocketAddress. port) 0)]
       (.setExecutor server (java.util.concurrent.Executors/newCachedThreadPool))

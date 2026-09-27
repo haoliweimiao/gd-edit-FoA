@@ -165,6 +165,12 @@
           </label>
         </div>
         <div id="stash-settings">
+          <label>语言
+            <select id="stash-lang">
+              <option value="zh">中文</option>
+              <option value="en">English</option>
+            </select>
+          </label>
           <label><input type="checkbox" id="opt-name" checked> 名称</label>
           <label><input type="checkbox" id="opt-stack" checked> 叠堆数</label>
           <label><input type="checkbox" id="opt-empty" checked> 空格底色</label>
@@ -302,7 +308,7 @@ function buildIronCell(td, value) {
 function showCharacter(path) {
   currentPath = path;
   $("stash-view").style.display = "none";
-  fetch("/api/character?path=" + encodeURIComponent(path))
+  fetch("/api/character?path=" + encodeURIComponent(path) + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
       $("char-name").textContent = data.name;
@@ -337,6 +343,18 @@ var RARITY_TEXT = {
   "Broken": "破损", "Common": "普通", "Magical": "魔法", "Rare": "稀有",
   "Epic": "史诗", "Legendary": "传奇", "Quest": "任务"
 };
+var RARITY_TEXT_EN = {
+  "Broken": "Broken", "Common": "Common", "Magical": "Magical", "Rare": "Rare",
+  "Epic": "Epic", "Legendary": "Legendary", "Quest": "Quest"
+};
+
+function getLang() {
+  return localStorage.getItem("gdw.lang") === "en" ? "en" : "zh";
+}
+
+function langParam() { return "&lang=" + getLang(); }
+
+function rarityText() { return getLang() === "en" ? RARITY_TEXT_EN : RARITY_TEXT; }
 
 var stashState = { mode: "standard", pages: [], cur: 0 };
 
@@ -366,7 +384,7 @@ function bindPref(id, key) {
 }
 
 function loadStash() {
-  fetch("/api/stash?mode=" + stashState.mode)
+  fetch("/api/stash?mode=" + stashState.mode + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
       stashState.pages = data.pages || [];
@@ -402,7 +420,7 @@ function renderStashTabs() {
 }
 
 function loadStashPage(index) {
-  fetch("/api/stash/page?mode=" + stashState.mode + "&index=" + index)
+  fetch("/api/stash/page?mode=" + stashState.mode + "&index=" + index + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
       $("status").textContent = "公共仓库 · " + stashState.pages.length + " 页";
@@ -434,10 +452,10 @@ function renderStashGrid(data, index) {
       div.style.borderColor = RARITY_COLORS[rarity];
     }
     var nm = it.name || it.baseName || "?";
-    if (pref("gdw.showRarityText", true) && rarity && RARITY_TEXT[rarity]) {
+    if (pref("gdw.showRarityText", true) && rarity && rarityText()[rarity]) {
       var rt = document.createElement("span");
       rt.className = "st-rarity";
-      rt.textContent = RARITY_TEXT[rarity];
+      rt.textContent = rarityText()[rarity];
       div.appendChild(rt);
     }
     if (pref("gdw.showName", true) && it.name) {
@@ -455,7 +473,7 @@ function renderStashGrid(data, index) {
     var tip = [nm];
     if (it.prefixName) tip.push("前缀: " + it.prefixName);
     if (it.suffixName) tip.push("后缀: " + it.suffixName);
-    if (rarity) tip.push("稀有度: " + (RARITY_TEXT[rarity] || rarity));
+    if (rarity) tip.push("稀有度: " + (rarityText()[rarity] || rarity));
     tip.push("坐标 (" + it.x + "," + it.y + ")");
     tip.push("占地 " + (w === 1 && h === 1 ? "1×1" : w + "×" + h));
     if (it.stackCount > 1) tip.push("叠堆 " + it.stackCount);
@@ -471,6 +489,12 @@ bindPref("opt-rarity", "gdw.showRarity");
 bindPref("opt-rarity-text", "gdw.showRarityText");
 
 $("cell-input").value = String(getCell());
+$("stash-lang").value = getLang();
+$("stash-lang").addEventListener("change", function () {
+  localStorage.setItem("gdw.lang", this.value);
+  if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur].index);
+  if (currentPath) showCharacter(currentPath);
+});
 
 $("stash-btn").addEventListener("click", function () {
   document.querySelectorAll(".char.active").forEach(function (x) { x.classList.remove("active"); });

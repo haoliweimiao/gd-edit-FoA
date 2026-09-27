@@ -109,13 +109,15 @@
   (u/hashmap-with-keys #(seq (:uid %)) shrines-and-gates))
 
 (defn load-db-in-background
-  []
-  (intern 'gd-edit.globals 'localization-table (future (u/log-exceptions (load-localization-files))))
-  (intern 'gd-edit.globals 'db (future (u/log-exceptions (load-db @globals/localization-table))))
-  (intern 'gd-edit.globals 'db-index (future (build-db-index @globals/db)))
-  (intern 'gd-edit.globals 'db-and-index (future (build-db-and-index)))
-  (intern 'gd-edit.globals 'shrines-and-gates (future (load-shrines-and-gates)))
-  (intern 'gd-edit.globals 'shrines-and-gates-index (future (build-shrines-and-gates-index @globals/shrines-and-gates))))
+  ([] (load-db-in-background nil))
+  ([localization-override]
+   (intern 'gd-edit.globals 'localization-table (future (u/log-exceptions (or localization-override
+                                                                            (load-localization-files)))))
+   (intern 'gd-edit.globals 'db (future (u/log-exceptions (load-db @globals/localization-table))))
+   (intern 'gd-edit.globals 'db-index (future (build-db-index @globals/db)))
+   (intern 'gd-edit.globals 'db-and-index (future (build-db-and-index)))
+   (intern 'gd-edit.globals 'shrines-and-gates (future (load-shrines-and-gates)))
+   (intern 'gd-edit.globals 'shrines-and-gates-index (future (build-shrines-and-gates-index @globals/shrines-and-gates)))))
 
 
 (defn load-settings-file
