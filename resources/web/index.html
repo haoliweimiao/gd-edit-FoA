@@ -168,6 +168,54 @@
     color: var(--muted); font-size: 11px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; max-width: 420px;
   }
+
+  /* ---- 物品选择器 ---- */
+  #picker-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center; z-index: 20;
+  }
+  #picker {
+    width: 620px; max-width: 92vw; height: 70vh;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  .picker-head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+  }
+  .picker-title { font-size: 15px; font-weight: 600; }
+  .picker-pos { color: var(--muted); font-size: 13px; }
+  .picker-head .small-btn { margin-left: auto; }
+  .picker-search {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+  }
+  .picker-search input {
+    flex: 1; background: var(--panel-2); color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 9px; font-size: 13px;
+  }
+  .picker-total { color: var(--muted); font-size: 12px; white-space: nowrap; }
+  #picker-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+  .picker-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 14px; cursor: pointer; font-size: 13px;
+    border-left: 3px solid transparent;
+  }
+  .picker-row:hover { background: rgba(255,255,255,0.05); }
+  .picker-row.selected { background: rgba(79,156,249,0.16); border-left-color: var(--accent); }
+  .picker-row.disabled { opacity: 0.45; cursor: default; }
+  .picker-row .pk-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .picker-row .pk-rarity { width: 56px; font-size: 11px; }
+  .picker-row .pk-dims { width: 60px; flex: none; text-align: right; color: var(--muted); font-size: 11px; }
+  .picker-foot {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-top: 1px solid var(--border);
+  }
+  .picker-count { color: var(--muted); font-size: 13px; display: inline-flex; align-items: center; gap: 6px; }
+  .picker-count input { width: 68px; }
+  .picker-page { color: var(--muted); font-size: 12px; }
+  .picker-foot #picker-add { margin-left: auto; }
 </style>
 </head>
 <body>
@@ -231,6 +279,27 @@
 </main>
 <div id="error"></div>
 <div id="toast"></div>
+<div id="picker-overlay" style="display:none">
+  <div id="picker">
+    <div class="picker-head">
+      <span class="picker-title">选择物品</span>
+      <span class="picker-pos" id="picker-pos"></span>
+      <button class="small-btn" id="picker-close">✕</button>
+    </div>
+    <div class="picker-search">
+      <input type="text" id="picker-q" placeholder="搜索物品名称或路径…" autocomplete="off">
+      <span class="picker-total" id="picker-total"></span>
+    </div>
+    <div id="picker-list"></div>
+    <div class="picker-foot">
+      <label class="picker-count">数量 <input type="number" id="picker-count" min="1" max="9999" step="1" value="1"></label>
+      <button class="small-btn" id="picker-prev">上一页</button>
+      <span class="picker-page" id="picker-page"></span>
+      <button class="small-btn" id="picker-next">下一页</button>
+      <button class="small-btn primary" id="picker-add">新增</button>
+    </div>
+  </div>
+</div>
 <script>
 "use strict";
 
@@ -471,6 +540,7 @@ function renderStashTabs() {
 function loadStashPage(page) {
   clearItemDetail();
   stashState.curPage = page.index;
+  stashState.curPageKind = page.kind;
   if (page.kind === "char-sack") { loadCharSackPage(page); return; }
   if (page.kind === "equip" || page.kind === "weapon") { renderCharListPage(page); return; }
   if (page.kind && page.kind !== "grid") {
@@ -554,7 +624,7 @@ function loadCharSackPage(page) {
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
       $("status").textContent = "角色背包 · " + (stashState.charInv ? stashState.charInv.name : "")
-        + " · " + page.label + " · " + data.items.length + " 件";
+        + " · " + page.label + " · " + data.items.length + " 件 · 点击空白格可新增物品";
       renderStashGrid(data, page.index);
     })
     .catch(function (e) { showError("加载背包失败: " + e.message); });
@@ -746,6 +816,139 @@ function renderStashGrid(data, index) {
     div._el = div;
     grid.appendChild(div);
   });
+  stashState.pageDims = { width: data.width, height: data.height };
+  stashState.curPageKind = stashState._pageKind || "grid";
+}
+
+/* ---------- 新增物品选择器 ---------- */
+var pickerState = {
+  sack: null, x: null, y: null,
+  q: "", offset: 0, pageSize: 50, total: 0, selected: null
+};
+
+function buildOccupancy() {
+  var occ = {};
+  document.querySelectorAll("#stash-grid .stash-item").forEach(function (div) {
+    var it = div._item;
+    if (!it) return;
+    var w = (it.w && it.w > 0) ? it.w : 1;
+    var h = (it.h && it.h > 0) ? it.h : 1;
+    for (var dx = 0; dx < w; dx++) {
+      for (var dy = 0; dy < h; dy++) {
+        occ[(it.x + dx) + "," + (it.y + dy)] = true;
+      }
+    }
+  });
+  return occ;
+}
+
+function openPicker(sack, x, y) {
+  pickerState.sack = sack;
+  pickerState.x = x; pickerState.y = y;
+  pickerState.q = ""; pickerState.offset = 0; pickerState.selected = null;
+  $("picker-pos").textContent = "背包 " + (sack + 1) + " → (" + x + "," + y + ")";
+  $("picker-q").value = "";
+  $("picker-count").value = "1";
+  $("picker-overlay").style.display = "flex";
+  loadItems();
+}
+
+function closePicker() {
+  $("picker-overlay").style.display = "none";
+}
+
+function loadItems() {
+  var url = "/api/items?offset=" + pickerState.offset + "&limit=" + pickerState.pageSize + langParam()
+    + (pickerState.q ? "&q=" + encodeURIComponent(pickerState.q) : "");
+  fetch(url)
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      pickerState.total = data.total || 0;
+      renderItems(data.items || []);
+    })
+    .catch(function (e) { showError("加载物品列表失败: " + e.message); });
+}
+
+function renderItems(items) {
+  var list = $("picker-list");
+  list.innerHTML = "";
+  if (!items.length) {
+    var empty = document.createElement("div");
+    empty.style.cssText = "color:var(--muted);padding:24px;text-align:center";
+    empty.textContent = "没有匹配的物品";
+    list.appendChild(empty);
+  }
+  items.forEach(function (it) {
+    var row = document.createElement("div");
+    row.className = "picker-row";
+    var dimsOk = it.w && it.h && it.w > 0 && it.h > 0;
+    if (!dimsOk) {
+      row.classList.add("disabled");
+    } else if (pickerState.selected && pickerState.selected._base === it.baseName) {
+      row.classList.add("selected");
+    }
+    var cName = document.createElement("span");
+    cName.className = "pk-name";
+    cName.textContent = it.name || it.baseName;
+    row.appendChild(cName);
+    var cRarity = document.createElement("span");
+    cRarity.className = "pk-rarity";
+    var rt = rarityText()[it.rarity] || it.rarity || "";
+    if (rt) {
+      cRarity.textContent = rt;
+      if (RARITY_COLORS[it.rarity]) cRarity.style.color = RARITY_COLORS[it.rarity];
+    }
+    row.appendChild(cRarity);
+    var cDims = document.createElement("span");
+    cDims.className = "pk-dims";
+    cDims.textContent = dimsOk ? (it.w + "×" + it.h) : "无法占格";
+    row.appendChild(cDims);
+    row.title = it.baseName + (pickerState.x !== null
+      ? "\n新增位置: (" + pickerState.x + "," + pickerState.y + ")" : "");
+    if (dimsOk) {
+      row.addEventListener("click", function () {
+        pickerState.selected = { _base: it.baseName };
+        document.querySelectorAll(".picker-row.selected").forEach(function (x) { x.classList.remove("selected"); });
+        row.classList.add("selected");
+      });
+    }
+    list.appendChild(row);
+  });
+  var pageCnt = Math.max(1, Math.ceil(pickerState.total / pickerState.pageSize));
+  var pageNo = pickerState.total === 0 ? 0 : Math.floor(pickerState.offset / pickerState.pageSize) + 1;
+  $("picker-page").textContent = pageNo + " / " + pageCnt;
+  $("picker-total").textContent = "共 " + pickerState.total + " 件";
+  $("picker-prev").disabled = pickerState.offset <= 0;
+  $("picker-next").disabled = pickerState.offset + pickerState.pageSize >= pickerState.total;
+}
+
+function submitAdd() {
+  if (!pickerState.selected) { showError("请先选择要新增的物品"); return; }
+  var count = parseInt($("picker-count").value, 10);
+  if (isNaN(count) || count < 1 || count > 9999) { showError("数量必须是 1 ~ 9999 的整数"); return; }
+  var btn = $("picker-add");
+  btn.disabled = true;
+  fetch("/api/character/inventory/item", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      path: stashState.charPath, sack: pickerState.sack,
+      x: pickerState.x, y: pickerState.y,
+      basename: pickerState.selected._base, count: count
+    })
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (data) {
+      btn.disabled = false;
+      if (data.ok) {
+        closePicker();
+        showToast("已新增 ×" + count + "（备份: " + data.backup + "）");
+        loadStashPage(stashState.pages[stashState.cur]);
+      } else {
+        showError(data.error || "新增失败");
+      }
+    })
+    .catch(function (e) { btn.disabled = false; showError("新增失败: " + e.message); });
 }
 
 bindPref("opt-name", "gdw.showName");
@@ -785,6 +988,22 @@ $("stash-grid-wrap").addEventListener("click", function (e) {
       ? "source=sack&sack=" + stashState.curPage + "&slot=" + hit._item.slot
       : "page=" + stashState.curPage + "&slot=" + hit._item.slot;
     selectItem(hit._item, q);
+  } else if (stashState.source === "char" && stashState.curPageKind === "char-sack" && stashState.pageDims) {
+    var CELL = getCell();
+    var rect = $("stash-grid").getBoundingClientRect();
+    var gx = Math.floor((e.clientX - rect.left) / CELL);
+    var gy = Math.floor((e.clientY - rect.top) / CELL);
+    if (gx >= 0 && gy >= 0 && gx < stashState.pageDims.width && gy < stashState.pageDims.height) {
+      var occ = buildOccupancy();
+      if (occ.hasOwnProperty(gx + "," + gy)) {
+        clearItemDetail();
+      } else {
+        clearItemDetail();
+        openPicker(stashState.curPage, gx, gy);
+      }
+    } else {
+      clearItemDetail();
+    }
   } else {
     clearItemDetail();
   }
@@ -885,6 +1104,34 @@ $("cell-input").addEventListener("change", function () {
   var v = parseInt(this.value, 10);
   if (!isNaN(v) && v >= 24 && v <= 64) setCell(v);
   else this.value = String(getCell());
+});
+
+$("picker-close").addEventListener("click", closePicker);
+$("picker-overlay").addEventListener("click", function (e) {
+  if (e.target === $("picker-overlay")) closePicker();
+});
+var pickerTimer = null;
+$("picker-q").addEventListener("input", function () {
+  var self = this;
+  clearTimeout(pickerTimer);
+  pickerTimer = setTimeout(function () {
+    pickerState.q = self.value;
+    pickerState.offset = 0;
+    pickerState.selected = null;
+    loadItems();
+  }, 300);
+});
+$("picker-prev").addEventListener("click", function () {
+  pickerState.offset = Math.max(0, pickerState.offset - pickerState.pageSize);
+  loadItems();
+});
+$("picker-next").addEventListener("click", function () {
+  pickerState.offset += pickerState.pageSize;
+  loadItems();
+});
+$("picker-add").addEventListener("click", submitAdd);
+$("picker-count").addEventListener("keydown", function (e) {
+  if (e.key === "Enter") submitAdd();
 });
 
 loadCharacters();

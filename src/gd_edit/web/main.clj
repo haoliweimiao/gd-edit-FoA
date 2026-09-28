@@ -14,6 +14,7 @@
             [gd-edit.io.arz :as arz]
             [gd-edit.io.gdc :as gdc]
             [gd-edit.io.stash :as st]
+            [gd-edit.commands.item :as item]
             [gd-edit.utils :as u])
   (:import [com.sun.net.httpserver HttpExchange HttpHandler HttpServer]
            [java.net InetSocketAddress URLDecoder]
@@ -570,6 +571,156 @@
                      (item-detail-payload it (lang-table lang)))))
       nil)))
 
+;;------------------------------------------------------------------------------
+;; 物品池 + 新增背包物品（写档）
+;;------------------------------------------------------------------------------
+
+(def ^:private items-pool (atom nil))
+
+(defn- items-pool-build
+  "全物品基础池：records/items/ 下、剔除 loottables 等目录，且能解析出显示名的记录路径。
+   名称只存原始串（含 tag），解析交给 lang 表按需进行（全量解析约几十 ms，无需预热缓存）。"
+  []
+  (or @items-pool
+      (let [idx (dbu/db-recordname-index)
+            recs (->> (keys idx)
+                      (filter #(and (str/starts-with? % "records/items/")
+                                    (not (str/starts-with? % "records/items/loottables/"))))
+                      (keep (fn [p]
+                              (let [nm (try (dbu/item-name {:basename p}) (catch Throwable _ nil))]
+                                (when (and nm (not (str/blank? nm)))
+                                  {:baseName p :name nm}))))
+                      (sort-by (comp str/lower-case :name))
+                      (vec))]
+        (reset! items-pool recs)
+        recs)))
+
+(defn- items-search-payload
+  [q offset limit lang]
+  (ensure-gdx3-loaded!)
+  (let [table (lang-table lang)
+        all (items-pool-build)
+        q (when (seq q) (str/lower-case (str/trim q)))
+        filtered (if (seq q)
+                   (filter (fn [{:keys [baseName name]}]
+                             (let [nm (str/lower-case (str (strip-color-codes (resolve-tokens name table))))]
+                               (or (str/includes? (str/lower-case baseName) q)
+                                   (str/includes? nm q))))
+                           all)
+                   all)
+        total (count filtered)
+        page (->> filtered (drop (or offset 0)) (take limit))]
+    {:total total
+     :offset (or offset 0)
+     :limit limit
+     :items (mapv (fn [{:keys [baseName name]}]
+                    (let [dims (stash-item-dims {:basename baseName})]
+                      {:baseName baseName
+                       :name (strip-color-codes (resolve-tokens name table))
+                       :rarity (item-rarity baseName)
+                       :w (:width dims)
+                       :h (:height dims)}))
+                  page)}))
+
+(defn- sack-occupied?!
+  "背包袋内被占用的格子集合（纯坐标几何，不依赖全局 character）。
+   无法解析占格的物品按 1x1 计。"
+  [items width height]
+  (set (for [it items
+             :let [dims (stash-item-dims it)
+                   w (or (:width dims) 1)
+                   h (or (:height dims) 1)]
+             dx (range (max 1 w))
+             dy (range (max 1 h))
+             :let [cx (+ (int (:X it)) dx) cy (+ (int (:Y it)) dy)]
+             :when (and (<= 0 cx) (< cx width) (<= 0 cy) (< cy height))]
+         [cx cy])))
+
+(defn- add-char-item!
+  "在角色背包袋 (x,y) 新增一件 new-baseName，数量 qty（总是新增独立条目）。
+   空间不足（越界/重叠）抛 :status 409，禁止写入。"
+  [path sack-index x y new-baseName qty]
+  (ensure-gdx3-loaded!)
+  (let [c (gdc/load-character-file path)
+        sack (nth (:inventory-sacks c) sack-index nil)
+        idx (dbu/db-recordname-index)]
+    (when (nil? sack)
+      (throw (ex-info "背包袋不存在" {:status 400})))
+    (when (:unused sack)
+      (throw (ex-info "该背包袋未解锁，无法放入物品" {:status 400})))
+    (when-not (contains? idx new-baseName)
+      (throw (ex-info "物品不存在于数据库中" {:status 400})))
+    (let [{dwidth :width dheight :height} (sack-slot-dims sack-index)
+          dims (stash-item-dims {:basename new-baseName})
+          w (:width dims) h (:height dims)]
+      (when (or (nil? w) (nil? h) (not (pos? w)) (not (pos? h)))
+        (throw (ex-info "无法确定该物品的占格大小，拒绝新增" {:status 400})))
+      (when (or (nil? dwidth) (nil? dheight))
+        (throw (ex-info "无法确定背包袋尺寸" {:status 500})))
+      (when-not (and (<= 0 x) (<= 0 y) (<= (+ x w) dwidth) (<= (+ y h) dheight))
+        (throw (ex-info "无法放置：位置超出背包范围，新增失败" {:status 409})))
+      (let [occ (sack-occupied?! (:inventory-items sack) dwidth dheight)
+            cells (for [dx (range w) dy (range h)] [(+ x dx) (+ y dy)])]
+        (when-not (every? #(not (contains? occ %)) cells)
+          (throw (ex-info "无法放置：该位置已被物品占用，新增失败" {:status 409}))))
+      (let [backup (backup-copy! path)
+            it (merge (item/blank-item)
+                      {:basename new-baseName
+                       :stack-count qty
+                       :X x :Y y
+                       ;; GD 1.3 v13 物品尾部必需字段，缺失会导致写档断言失败
+                       :ascendant "" :ascendant2h ""
+                       :materia-combines 0 :rerolls 0 :v11-extra 0})
+            c2 (update-in c [:inventory-sacks sack-index :inventory-items] conj it)]
+        (gdc/write-character-file c2 path)
+        (let [items (get-in (gdc/load-character-file path)
+                            [:inventory-sacks sack-index :inventory-items])
+              last-it (last items)]
+          (if (and (= (clojure.core/count items) (inc (clojure.core/count (:inventory-items sack))))
+                   (= (:basename last-it) new-baseName)
+                   (= (:X last-it) x)
+                   (= (:Y last-it) y)
+                   (= (:stack-count last-it) qty))
+            {:ok true :backup backup
+             :item {:baseName new-baseName :x x :y y :count qty}}
+            (throw (ex-info "写入校验失败，数据未新增" {:status 500}))))))))
+
+(defn- handle-inventory-item-post
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        sack (:sack body)
+        x (:x body) y (:y body)
+        basename (:basename body)
+        count (or (:count body) 1)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (and (integer? sack) (<= 0 sack)))
+      (send-json! exchange 400 {:ok false :error "无效的背包袋序号"})
+
+      (not (and (integer? x) (integer? y) (<= 0 x) (<= 0 y)))
+      (send-json! exchange 400 {:ok false :error "无效的坐标"})
+
+      (not (and (string? basename) (str/starts-with? basename "records/items/")))
+      (send-json! exchange 400 {:ok false :error "无效的物品路径"})
+
+      (not (and (integer? count) (<= 1 count 9999)))
+      (send-json! exchange 400 {:ok false :error "数量必须是 1 ~ 9999 的整数"})
+
+      :else
+      (try
+        (send-json! exchange 200 (add-char-item! path sack x y basename count))
+        (catch clojure.lang.ExceptionInfo e
+          (send-json! exchange (or (:status (ex-data e)) 500)
+                      {:ok false :error (.getMessage e)}))
+        (catch Throwable e
+          (send-json! exchange 500 {:ok false :error (str e)}))))))
+
 (defn- parse-query-param
   [query key]
   (->> (str/split (or query "") #"&")
@@ -585,6 +736,17 @@
     (if raw
       (try (Integer/parseInt raw) (catch Throwable _ nil))
       default)))
+
+(defn- handle-items-search
+  [exchange query]
+  (let [q (parse-query-param query "q")
+        offset (or (parse-int-param query "offset" 0) 0)
+        limit (min (or (parse-int-param query "limit" 50) 50) 200)
+        lang (or (parse-query-param query "lang") "zh")]
+    (try
+      (send-json! exchange 200 (items-search-payload q offset limit lang))
+      (catch Throwable e
+        (send-json! exchange 500 {:error (str e)})))))
 
 (defn- send!
   [exchange status body content-type]
@@ -627,6 +789,9 @@
         (= path "/api/character/money")
         (send-json! exchange 405 {:error "method not allowed"})
 
+        (and (= path "/api/items") query)
+        (handle-items-search exchange query)
+
         (and (= path "/api/character/inventory") query)
         (let [p (parse-query-param query "path")
               lang (or (parse-query-param query "lang") "zh")]
@@ -658,6 +823,9 @@
                 (send-json! exchange 404 {:error (str "背包袋不存在: " sack)}))
               (catch Throwable e
                 (send-json! exchange 500 {:error (str e)})))))
+
+        (and (= path "/api/character/inventory/item") (= method "POST"))
+        (handle-inventory-item-post exchange)
 
         (and (= path "/api/character/inventory/item") query)
         (let [p (parse-query-param query "path")
