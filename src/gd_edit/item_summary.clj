@@ -15,37 +15,44 @@
 (defn sign
   [number]
   (when number
-    (if (> number 0)
-      "+")))
+    (let [n (if (sequential? number) (first number) number)]
+      (if (and n (> n 0))
+        "+"))))
 
 (defn number
   [number]
   (when number
-    (yellow (str number))))
+    (yellow
+     (str (if (sequential? number) (str/join "-" number) number)))))
 
 (defn signed-number
   [number]
   (when number
     (yellow
-     (str (sign number) number))))
+     (str (sign number)
+          (if (sequential? number) (str/join "-" number) number)))))
 
 (defn signed-percentage
   [number]
   (when number
     (yellow
-     (str (sign number) number "%"))))
+     (str (sign number)
+          (if (sequential? number) (str/join "-" number) number)
+          "%"))))
 
 (defn percentage
   [number]
   (when number
     (yellow
-     (str number "%"))))
+     (str (if (sequential? number) (str/join "-" number) number)
+          "%"))))
 
 (defn record-class-subtype
   [base-record]
-  (let [class (base-record "Class")]
-    (u/swallow-exceptions
-      (str/lower-case (subs class (inc (str/last-index-of class "_")))))))
+  (when base-record
+    (let [class (base-record "Class")]
+      (u/swallow-exceptions
+        (str/lower-case (subs class (inc (str/last-index-of class "_"))))))))
 
 (defn record-class-display-name
   [class]
@@ -161,7 +168,7 @@
     (or
      (when-let [skill-level (record "itemSkillLevel")]
        (nth v skill-level))
-     (throw (ex-info "Cannot select a value from an array" (u/collect-as-map record v))))
+     (when (every? number? v) v))
     v))
 
 (defn maybe-resolve-v
@@ -314,7 +321,7 @@
 (defn val-or-range->string
   [v & opts]
   ;; (u/print-line v)
-  (if (seq? v)
+  (if (sequential? v)
     (if (> (count v) 1)
       (apply format "%s-%s"
              (map #(apply val->string- % opts) v))
@@ -720,14 +727,15 @@
 
 (defn- calc-item-skill-level
   [record]
-  (when (and (not (record "itemSkillLevel"))
+  (when (and record
+             (not (record "itemSkillLevel"))
              (record "itemSkillLevelEq")
              (or
               (record "levelRequirement")
               (record "itemLevel")))
     (dec (int (eq/evaluate (record "itemSkillLevelEq")
                            {"itemLevel" (or (record "itemLevel")
-                                            (record "levelRequirement"))})))))
+                                             (record "levelRequirement"))})))))
 
 (defn effect-summary
   ([record]
@@ -844,54 +852,58 @@
 (defn item-summary
   [item]
 
-  (let [base-record (dbu/record-by-name (:basename item))
-        subtype (record-class-subtype base-record)
-        item-skill-level (calc-item-skill-level base-record)]
+  (let [base-record (dbu/record-by-name (:basename item))]
+    ;; base-record 未收录于 DB 索引（如部分升级/锻造记录）时无属性可查，仅输出名称
+    (if (nil? base-record)
+      [(yellow (dbu/item-name item))
+       (red (str "Record not indexed: " (:basename item)))]
+      (let [subtype (record-class-subtype base-record)
+            item-skill-level (calc-item-skill-level base-record)]
 
-    (->>
-     [;; Name of item
-      (yellow (dbu/item-name item))
-      (when-let [item-text (base-record "itemText")]
-        (u/wrap-line 80 item-text))
+        (->>
+         [;; Name of item
+          (yellow (dbu/item-name item))
+          (when-let [item-text (base-record "itemText")]
+            (u/wrap-line 80 item-text))
 
-      ;; Item classification
-      (let [classifications (conj (into [] (vals (select-keys base-record ["itemClassification" "armorClassification"])))
-                                  (record-class-display-name (base-record "Class")))]
-        (str/join " " classifications))
+          ;; Item classification
+          (let [classifications (conj (into [] (vals (select-keys base-record ["itemClassification" "armorClassification"])))
+                                      (record-class-display-name (base-record "Class")))]
+            (str/join " " classifications))
 
-      (record-primary-attributes base-record)
+          (record-primary-attributes base-record)
 
-      ;; Item effects
-      ""
-      (effect-summary (->> (dissoc base-record
-                                   "defensiveProtection"
-                                   "offensivePhysicalMin"
-                                   "offensivePierceRatioMin")
-                           (filter (fn [[k v]]
-                                     (not (str/starts-with? k "offensiveBase"))))
-                           (into {})))
+          ;; Item effects
+          ""
+          (effect-summary (->> (dissoc base-record
+                                       "defensiveProtection"
+                                       "offensivePhysicalMin"
+                                       "offensivePierceRatioMin")
+                               (filter (fn [[k v]]
+                                         (not (str/starts-with? k "offensiveBase"))))
+                               (into {})))
 
-      (when-let [prefix (dbu/record-by-name (:prefix-name item))]
-        (effect-summary (cond-> prefix
-                          item-skill-level
-                          (assoc "itemSkillLevel" item-skill-level))))
+          (when-let [prefix (dbu/record-by-name (:prefix-name item))]
+            (effect-summary (cond-> prefix
+                              item-skill-level
+                              (assoc "itemSkillLevel" item-skill-level))))
 
-      (when-let [suffix (dbu/record-by-name (:suffix-name item))]
-        (effect-summary (cond-> suffix
-                          item-skill-level
-                          (assoc "itemSkillLevel" item-skill-level))))
+          (when-let [suffix (dbu/record-by-name (:suffix-name item))]
+            (effect-summary (cond-> suffix
+                              item-skill-level
+                              (assoc "itemSkillLevel" item-skill-level))))
 
-      ;; Requirements section
-      ""
-      (when-let [level-req (base-record "levelRequirement")]
-        (format "Required Player Level: %s" (number level-req)))
+          ;; Requirements section
+          ""
+          (when-let [level-req (base-record "levelRequirement")]
+            (format "Required Player Level: %s" (number level-req)))
 
-      (record-cost base-record)
+          (record-cost base-record)
 
-      (format "Item Level: %s" (number (base-record "itemLevel")))]
-     flatten
-     (remove nil?)
-     dedupe)))
+          (format "Item Level: %s" (number (base-record "itemLevel")))]
+         flatten
+         (remove nil?)
+         dedupe)))))
 
 (defn interesting-fields
   [record]

@@ -142,6 +142,96 @@
       {:meta-stash-seed seed
        :meta-stash-loaded-from filepath})))
 
+;;------------------------------------------------------------------------------
+;; GD 1.3 目录容器（transmutes/reagents 等公共仓库附属页，magic=1）
+;;
+;; 结构：16B 头 + magic(1) + block-id + block-length + 内容 + 校验和。
+;; 内容 = 版本 int + 二进制头 + 一串 {掩码物品路径} + {尾随二进制元数据} 记录。
+;; 物品路径用「每条记录独立」的 XOR 掩码混淆；此处只做物品路径提取：
+;; 逐字节判断该位置是否为首字节掩码一致的 "records/" 特征串，再按掩码解码路径。
+;;------------------------------------------------------------------------------
+
+(def ^:private catalog-codepoint-valid?
+  (fn [c]
+    (or (<= (int \0) c (int \9))
+        (<= (int \a) c (int \z))
+        (<= (int \A) c (int \Z))
+        (= c (int \/))
+        (= c (int \.))
+        (= c (int \_))
+        (= c (int \-)))))
+
+(def ^:private catalog-needle
+  (mapv int "records/"))
+
+(defn- catalog-needle-at?
+  [raw i k]
+  (loop [j 0]
+    (if (= j (count catalog-needle))
+      true
+      (and (= (bit-and 0xff (bit-xor (nth raw (+ i j)) k))
+              (nth catalog-needle j))
+           (recur (inc j))))))
+
+(defn- catalog-decode-path
+  [raw i k]
+  (let [n (count raw)
+        sb (java.lang.StringBuilder.)]
+    (loop [j i]
+      (let [c (bit-and 0xff (bit-xor (nth raw j) k))]
+        (when (catalog-codepoint-valid? c)
+          (.append sb (char c))
+          (when (< (inc j) n) (recur (inc j))))))
+    (let [s (str sb)
+          idx (.indexOf s ".dbr")]
+      (when (>= idx 0)
+        (subs s 0 (+ idx 4))))))
+
+(defn- extract-catalog-paths
+  "从解密后内容中逐串自检出全部物品 dbr 路径。"
+  [^bytes content]
+  (let [raw (mapv #(bit-and 0xff (long %)) content)
+        n (count raw)
+        m (count catalog-needle)]
+    (loop [i 0
+           acc (transient [])]
+      (if (>= i (- n m))
+        (persistent! acc)
+        (let [k (bit-xor (nth raw i) (nth catalog-needle 0))]
+          (if (catalog-needle-at? raw i k)
+            (if-let [path (catalog-decode-path raw i k)]
+              (recur (+ i m 1) (conj! acc path))
+              (recur (inc i) acc))
+            (recur (inc i) acc)))))))
+
+(defn load-catalog-file
+  "读取 GD 1.3 magic=1 目录容器（如 transmutes.gst/reagents.gst），
+   仅提取全部物品 dbr 路径。返回 {:item-paths [...] :items n :meta-catalog-id id}。"
+  [filepath]
+  (let [bb ^ByteBuffer (u/file-contents filepath)
+        _ (.order bb java.nio.ByteOrder/LITTLE_ENDIAN)
+        seed (bit-xor (Integer/toUnsignedLong (.getInt bb)) 1431655765)
+        enc-table (gdc/generate-encryption-table seed)
+        enc-context (make-enc-context seed enc-table)
+        magic-number (gdc/read-int! bb enc-context)]
+    (when (not= magic-number 1)
+      (throw (Throwable. (str "无法解析该目录容器格式（magic=" magic-number " ≠ 1）"))))
+    (let [id (gdc/read-int! bb enc-context)
+          length (gdc/decrypt-int (.getInt bb) (:enc-state @enc-context))
+          ^bytes content (byte-array length)
+          _ (.get bb content 0 length)
+          final-state (gdc/decrypt-bytes! content {:enc-state (:enc-state @enc-context)
+                                                   :enc-table  (:enc-table @enc-context)})
+          _ (swap! enc-context assoc :enc-state final-state)
+          ;; 注：内容中 int 字段按大端倒序推进状态、字符串字节按顺序推进，二者混合；
+          ;; 批量按顺序解密会导致整体状态与真实读写偏离，故校验和仅作参考不强制。
+          checksum (Integer/toUnsignedLong (.getInt bb))
+          paths (extract-catalog-paths content)]
+      {:meta-catalog-id id
+       :meta-checksum-match (= checksum (:enc-state @enc-context))
+       :item-paths paths
+       :items (count paths)})))
+
 (defn write-stash-file
   [stash savepath]
   (let [bb (ByteBuffer/allocate (* 10 1024 1024))

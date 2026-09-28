@@ -10,6 +10,7 @@
             [gd-edit.globals :as globals]
             [gd-edit.inventory :as inv]
             [gd-edit.io.arc :as arc]
+            [gd-edit.item-summary :as isummary]
             [gd-edit.io.arz :as arz]
             [gd-edit.io.gdc :as gdc]
             [gd-edit.io.stash :as st]
@@ -320,8 +321,75 @@
                :rarity (item-rarity (:basename it))
                :prefixName (strip-color-codes (affix-name (:prefix-name it)))
                :suffixName (strip-color-codes (affix-name (:suffix-name it)))}))
-          (range)
-          items)))
+           (range)
+           items)))
+
+(declare catalog-items catalog-kind-labels catalog-kinds)
+
+(defn- ansi-runs
+  "把带 Jansi ANSI SGR 色码的文本解析为 [text color] run 列表。
+  仅关注 item-summary 用到的前景色：33 黄 / 31 红 / 32 绿 / 1 粗体 / 0 复位。"
+  [s]
+  (loop [m (re-matcher #"\u001b\[([0-9;]*)m" s)
+         pos 0
+         color nil
+         runs (transient [])]
+    (if (.find m)
+      (let [start (.start m)
+            end (.end m)
+            text (subs s pos start)
+            code (.group m 1)]
+        (recur m end
+               (case code
+                 "0" nil
+                 "31" :r
+                 "32" :g
+                 "33" :y
+                 "1" color
+                 color)
+               (if (seq text)
+                 (conj! runs [text color])
+                 runs)))
+      (let [text (subs s pos)]
+        (persistent!
+         (if (seq text)
+           (conj! runs [text color])
+           runs))))))
+
+(defn- strip-gd-markup
+  "去除 GD 文本标记：颜色码（^g/^F/^c 等）与技能引用的 <> 尖括号标记
+  （游戏内不显示尖括号本体）。仅用于详情管线，不动网格名称的 strip-color-codes。"
+  [s]
+  (when s (-> s (str/replace #"\^[A-Za-z]" "") (str/replace #"[<>]" ""))))
+
+(defn- item-detail-runs
+  "item-summary 输出（去掉首行名称）逐行转为 [[text class] ...]；文本本地化并去 GD 标记。"
+  [item table]
+  (try
+    (->> (rest (isummary/item-summary item))
+         (mapv (fn [line]
+                 (->> (ansi-runs line)
+                      (mapv (fn [[text color]]
+                              [(resolve-tokens (strip-gd-markup text) table)
+                               (when color (name color))]))))))
+    (catch Throwable _ [])))
+
+(defn- item-detail-payload
+  [it table]
+  (let [nm (try (dbu/item-name it) (catch Throwable _ nil))
+        dims (stash-item-dims it)]
+    {:name (strip-gd-markup (resolve-tokens nm table))
+     :baseName (:basename it)
+     :rarity (item-rarity (:basename it))
+     :stackCount (:stack-count it)
+     :w (:width dims)
+     :h (:height dims)
+     :lines (item-detail-runs it table)}))
+
+(defn- stash-item-detail-payload
+  [sack slot table]
+  (when-let [it (nth (:inventory-items sack) slot nil)]
+    (item-detail-payload it table)))
 
 (defn- stash-payload
   [mode]
@@ -331,6 +399,12 @@
      :mode mode
      :file path
      :has-hardcore (.isFile (io/file (stash-file-path "hardcore")))
+     :extra (vec (keep (fn [kind]
+                         (when-let [paths (catalog-items kind mode)]
+                           {:kind kind
+                            :label (get catalog-kind-labels kind kind)
+                            :itemCount (count paths)}))
+                       catalog-kinds))
      :pages (->> (:stash s)
                  (map-indexed
                   (fn [idx sack]
@@ -353,6 +427,52 @@
       {:width (:width sack)
        :height (:height sack)
        :items (stash-items-payload sack table)})))
+
+;; GD 1.3 目录附页（magic=1 容器）：镶嵌物+材料 目录，无网格，只有物品列表。
+(def ^:private catalog-kinds
+  ^:export ["reagents"])
+
+(def ^:private catalog-kind-labels
+  {"reagents" "镶嵌物·材料"})
+
+(defn- catalog-file-path
+  [mode kind]
+  (str (io/file (stash-save-root) (str kind (if (= mode "hardcore") ".gsh" ".gst")))))
+
+(def ^:private catalog-cache (atom {}))
+
+(defn- catalog-items
+  "解析并缓存目录附页的物品路径（按 [文件+mtime] 缓存）。"
+  [kind mode]
+  (let [f (io/file (catalog-file-path mode kind))]
+    (when (.isFile f)
+      (let [key (str (catalog-file-path mode kind) ":" (.lastModified f))
+            hit (get @catalog-cache key ::missing)]
+        (if (identical? hit ::missing)
+          (let [paths (try (:item-paths (st/load-catalog-file (.getPath f)))
+                           (catch Throwable _ nil))]
+            (swap! catalog-cache assoc key paths)
+            paths)
+          hit)))))
+
+(defn- catalog-page-payload
+  [kind mode lang]
+  (ensure-gdx3-loaded!)
+  (let [table (lang-table lang)]
+    (when-let [paths (catalog-items kind mode)]
+      {:kind kind
+       :label (get catalog-kind-labels kind kind)
+       :itemCount (count paths)
+       :items (mapv (fn [path]
+                      (let [it {:basename path}]
+                        {:name (or (strip-color-codes
+                                    (resolve-tokens (try (dbu/item-name it) (catch Throwable _ nil))
+                                                    table))
+                                   (last (str/split path #"/")))
+                         :baseName path
+                         :rarity (item-rarity path)
+                         :count 1}))
+                    paths)})))
 
 (defn- parse-query-param
   [query key]
@@ -433,6 +553,47 @@
             (if-let [data (stash-page-payload mode index lang)]
               (send-json! exchange 200 data)
               (send-json! exchange 404 {:error (str "页不存在: " index)}))))
+
+        (and (= path "/api/stash/extra") query)
+        (let [mode (or (parse-query-param query "mode") "standard")
+              kind (parse-query-param query "kind")
+              lang (or (parse-query-param query "lang") "zh")]
+          (cond
+            (not (some #(= % kind) catalog-kinds))
+            (send-json! exchange 400 {:error "未知的目录页 kind"})
+
+            :else
+            (if-let [data (catalog-page-payload kind mode lang)]
+              (send-json! exchange 200 data)
+              (send-json! exchange 404 {:error (str "未找到 " kind " 仓库文件或解析失败")}))))
+
+        (and (= path "/api/stash/item") query)
+        (let [mode (or (parse-query-param query "mode") "standard")
+              lang (or (parse-query-param query "lang") "zh")
+              _ (ensure-gdx3-loaded!)
+              table (lang-table lang)
+              page (parse-int-param query "page" nil)
+              slot (parse-int-param query "slot" nil)
+              kind (parse-query-param query "kind")
+              path (parse-query-param query "path")]
+          (cond
+            (not (.isFile (io/file (stash-file-path mode))))
+            (send-json! exchange 404 {:error (str "未找到共享仓库文件: " (stash-file-path mode))})
+
+            (and kind path)
+            (if (some #(= % kind) catalog-kinds)
+              (send-json! exchange 200 (item-detail-payload {:basename path} table))
+              (send-json! exchange 400 {:error "未知的目录页 kind"}))
+
+            (and (some? page) (some? slot))
+            (let [s (st/load-stash-file (stash-file-path mode))
+                  sack (nth (:stash s) page nil)]
+              (if-let [data (and sack (stash-item-detail-payload sack slot table))]
+                (send-json! exchange 200 data)
+                (send-json! exchange 404 {:error (str "物品不存在: page=" page " slot=" slot)})))
+
+            :else
+            (send-json! exchange 400 {:error "缺少 page/slot 或 kind/path 参数"})))
 
         :else
         (send-json! exchange 404 {:error "not found"})))

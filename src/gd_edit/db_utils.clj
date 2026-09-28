@@ -145,12 +145,12 @@
 
            ;; Otherwise, we should fetch the prefix and suffix name to construct the complete name
            ;; of the item
-           (let [prefix-name (-> (filter #(str/includes? (:recordname %1) "/prefix/") related-records)
-                                 (first)
-                                 (get "lootRandomizerName"))
-                 suffix-name (-> (filter #(str/includes? (:recordname %1) "/suffix/") related-records)
-                                 (first)
-                                 (get "lootRandomizerName"))
+           (let [prefix-name (-> (filter #(some-> (:recordname %1) (str/includes? "/prefix/")) related-records)
+                                  (first)
+                                  (get "lootRandomizerName"))
+                 suffix-name (-> (filter #(some-> (:recordname %1) (str/includes? "/suffix/")) related-records)
+                                  (first)
+                                  (get "lootRandomizerName"))
                  quality-name (item-base-record-get-quality-name base-record)]
 
              (->> [prefix-name quality-name base-name suffix-name]

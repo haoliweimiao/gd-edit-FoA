@@ -23,7 +23,7 @@
           :mul *
           :div /
           :exp #(Math/pow %1 %2)
-          :identifier #(variables %1)
+          :identifier #(get variables %1 0)
           :integer edn/read-string
           :float clojure.edn/read-string
           :expr identity}))))

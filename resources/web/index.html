@@ -44,8 +44,9 @@
   }
   .char:hover { border-color: var(--accent); }
   .char.active { border-color: var(--accent); background: #26313f; }
-  #detail-pane { flex: 1; overflow-y: auto; padding: 20px 26px; }
-  #detail-empty { color: var(--muted); margin-top: 40px; text-align: center; }
+  #detail-pane { flex: 1; display: flex; flex-direction: column; min-height: 0; overflow: hidden; }
+  #detail-empty { color: var(--muted); margin-top: 40px; text-align: center; padding: 20px 26px 0; }
+  #detail { display: none; overflow-y: auto; padding: 20px 26px; }
   .char-title { font-size: 17px; font-weight: 600; margin-bottom: 14px; }
   table { border-collapse: collapse; width: 100%; max-width: 520px; }
   td {
@@ -81,8 +82,28 @@
   .small-btn:disabled { opacity: 0.5; cursor: default; }
 
   /* ---- 公共仓库 ---- */
-  #stash-view { max-width: 1100px; }
-  #stash-toolbar { display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; margin-bottom: 12px; }
+  #stash-view { display: none; flex: 1; flex-direction: column; min-height: 0; overflow: hidden; padding: 20px 26px; max-width: 1100px; }
+  #stash-toolbar { flex: none; display: flex; flex-wrap: wrap; gap: 8px 22px; align-items: center; margin-bottom: 12px; }
+  #stash-tabs { flex: none; display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
+  #stash-body { flex: 1; display: flex; min-height: 0; gap: 14px; }
+  #stash-grid-wrap { flex: 1; overflow: auto; }
+  #item-detail {
+    flex: none; width: 380px; max-width: 46vw; display: none;
+    border-left: 1px solid var(--border); background: var(--panel);
+    border-radius: 6px; padding: 14px; overflow-y: auto;
+  }
+  #item-detail.open { display: block; }
+  #item-detail-head { padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+  #item-detail-name { font-size: 15px; font-weight: 600; word-break: break-word; }
+  #item-detail-sub { color: var(--muted); font-size: 12px; margin-top: 5px; line-height: 1.5; }
+  #idetail-lines { font-size: 13px; line-height: 1.55; }
+  #idetail-lines .line.empty { height: 8px; }
+  #idetail-lines .y { color: #e6c14f; }
+  #idetail-lines .r { color: var(--danger); }
+  #idetail-lines .g { color: #6ec28a; }
+  #idetail-lines .b { font-weight: 600; }
+  .stash-item.selected { outline: 2px solid var(--accent); z-index: 3; }
+  .catalog-list tbody tr.selected { background: rgba(79,156,249,0.16); }
   #stash-settings { display: flex; flex-wrap: wrap; gap: 6px 18px; align-items: center; font-size: 13px; color: var(--muted); }
   #stash-settings label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; }
   #stash-settings input[type=checkbox] { accent-color: var(--accent); }
@@ -93,7 +114,6 @@
     border: 1px solid var(--border); border-radius: 4px;
     padding: 4px 8px; font-size: 13px; margin-left: 6px;
   }
-  #stash-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin: 4px 0 14px; }
   .tab-btn {
     background: var(--panel-2); color: var(--muted);
     border: 1px solid var(--border); border-radius: 5px;
@@ -133,6 +153,21 @@
     font-size: 8px; opacity: 0.85; letter-spacing: 0.5px;
   }
   #stash-empty { color: var(--muted); text-align: center; margin-top: 30px; }
+  .catalog-list { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+  .catalog-list th {
+    text-align: left; padding: 5px 10px; color: var(--muted);
+    border-bottom: 1px solid var(--border); font-weight: 600; white-space: nowrap;
+  }
+  .catalog-list td {
+    padding: 4px 10px; border-bottom: 1px solid rgba(255,255,255,0.06);
+    vertical-align: middle;
+  }
+  .catalog-list tbody tr:hover { background: rgba(255,255,255,0.05); }
+  .catalog-list .cat-count { color: var(--accent); white-space: nowrap; text-align: right; }
+  .catalog-list .cat-path {
+    color: var(--muted); font-size: 11px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; max-width: 420px;
+  }
 </style>
 </head>
 <body>
@@ -184,7 +219,12 @@
         </div>
       </div>
       <div id="stash-tabs"></div>
-      <div id="stash-grid"></div>
+      <div id="stash-body">
+        <div id="stash-grid-wrap">
+          <div id="stash-grid"></div>
+        </div>
+        <div id="item-detail"></div>
+      </div>
     </div>
   </div>
 </main>
@@ -307,6 +347,7 @@ function buildIronCell(td, value) {
 
 function showCharacter(path) {
   currentPath = path;
+  clearItemDetail();
   $("stash-view").style.display = "none";
   fetch("/api/character?path=" + encodeURIComponent(path) + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
@@ -356,7 +397,7 @@ function langParam() { return "&lang=" + getLang(); }
 
 function rarityText() { return getLang() === "en" ? RARITY_TEXT_EN : RARITY_TEXT; }
 
-var stashState = { mode: "standard", pages: [], cur: 0 };
+var stashState = { mode: "standard", pages: [], cur: 0, curPage: 0, catalogKind: "", selected: null };
 
 function pref(key, def) {
   var v = localStorage.getItem(key);
@@ -372,22 +413,27 @@ function setCell(v) {
   v = Math.max(24, Math.min(64, v));
   localStorage.setItem("gdw.cell", String(v));
   $("cell-input").value = String(v);
-  if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur].index);
+  if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur]);
 }
 
 function bindPref(id, key) {
   $(id).checked = pref(key, true);
   $(id).addEventListener("change", function () {
     localStorage.setItem(key, $(id).checked ? "true" : "false");
-    if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur].index);
+    if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur]);
   });
 }
 
 function loadStash() {
+  clearItemDetail();
   fetch("/api/stash?mode=" + stashState.mode + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
-      stashState.pages = data.pages || [];
+      stashState.pages = (data.pages || []).map(function (p) { p.kind = "grid"; return p; });
+      (data.extra || []).forEach(function (e) {
+        stashState.pages.push({ kind: "catalog:" + e.kind, index: e.kind,
+                                label: e.label, itemCount: e.itemCount });
+      });
       $("stash-mode").style.display = data["has-hardcore"] ? "" : "none";
       renderStashTabs();
       if (!stashState.pages.length) {
@@ -397,7 +443,7 @@ function loadStash() {
         return;
       }
       stashState.cur = 0;
-      loadStashPage(stashState.pages[0].index);
+      loadStashPage(stashState.pages[0]);
     })
     .catch(function (e) { showError("加载公共仓库失败: " + e.message); });
 }
@@ -413,20 +459,97 @@ function renderStashTabs() {
     b.addEventListener("click", function () {
       stashState.cur = i;
       renderStashTabs();
-      loadStashPage(p.index);
+      loadStashPage(p);
     });
     tabs.appendChild(b);
   });
 }
 
-function loadStashPage(index) {
-  fetch("/api/stash/page?mode=" + stashState.mode + "&index=" + index + langParam())
+function loadStashPage(page) {
+  clearItemDetail();
+  stashState.curPage = page.index;
+  if (page.kind && page.kind !== "grid") {
+    loadCatalogPage(page);
+    return;
+  }
+  fetch("/api/stash/page?mode=" + stashState.mode + "&index=" + page.index + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
       $("status").textContent = "公共仓库 · " + stashState.pages.length + " 页";
-      renderStashGrid(data, index);
+      renderStashGrid(data, page.index);
     })
     .catch(function (e) { showError("加载页面失败: " + e.message); });
+}
+
+function loadCatalogPage(page) {
+  clearItemDetail();
+  var kind = page.kind.slice("catalog:".length);
+  stashState.catalogKind = kind;
+  fetch("/api/stash/extra?mode=" + stashState.mode + "&kind=" + encodeURIComponent(kind) + langParam())
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      $("status").textContent = "公共仓库 · " + data.label + " · " + data.itemCount + " 件";
+      renderCatalog(data);
+    })
+    .catch(function (e) { showError("加载 " + page.label + " 失败: " + e.message); });
+}
+
+function renderCatalog(data) {
+  var grid = $("stash-grid");
+  grid.style.width = "";
+  grid.style.height = "";
+  grid.style.backgroundColor = "rgba(255,255,255,0.035)";
+  grid.innerHTML = "";
+  var tbl = document.createElement("table");
+  tbl.className = "catalog-list";
+  var thead = document.createElement("thead");
+  var hr = document.createElement("tr");
+  ["名称", "稀有度", "数量", "路径"].forEach(function (h) {
+    var th = document.createElement("th");
+    th.textContent = h;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  tbl.appendChild(thead);
+  var tbody = document.createElement("tbody");
+  (data.items || []).forEach(function (it) {
+    var tr = document.createElement("tr");
+    var rarity = it.rarity;
+    if (pref("gdw.showRarity", true) && rarity && RARITY_COLORS[rarity]) {
+      tr.style.borderLeft = "3px solid " + RARITY_COLORS[rarity];
+    }
+    var cName = document.createElement("td");
+    if (pref("gdw.showName", true) && it.name) cName.textContent = it.name;
+    var cRarity = document.createElement("td");
+    var rt = rarityText()[rarity] || rarity || "";
+    if (pref("gdw.showRarityText", true) && rt) {
+      cRarity.textContent = rt;
+      if (RARITY_COLORS[rarity]) cRarity.style.color = RARITY_COLORS[rarity];
+    }
+    var cCount = document.createElement("td");
+    cCount.className = "cat-count";
+    cCount.textContent = "×" + (it.count || 1);
+    var cPath = document.createElement("td");
+    cPath.className = "cat-path";
+    cPath.textContent = it.baseName || "";
+    tr.appendChild(cName);
+    tr.appendChild(cRarity);
+    tr.appendChild(cCount);
+    tr.appendChild(cPath);
+    if (pref("gdw.showName", true) && it.name) {
+      tr.title = [it.name, "稀有度: " + (rarityText()[rarity] || rarity),
+                  "数量: " + (it.count || 1), it.baseName].join(" | ");
+    }
+    tr._item = it;
+    tr._el = tr;
+    tr.addEventListener("click", function () {
+      selectItem(it, "kind=" + encodeURIComponent(stashState.catalogKind) +
+                     "&path=" + encodeURIComponent(it.baseName));
+    });
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  grid.appendChild(tbl);
 }
 
 function renderStashGrid(data, index) {
@@ -478,6 +601,8 @@ function renderStashGrid(data, index) {
     tip.push("占地 " + (w === 1 && h === 1 ? "1×1" : w + "×" + h));
     if (it.stackCount > 1) tip.push("叠堆 " + it.stackCount);
     div.title = tip.join(" | ");
+    div._item = it;
+    div._el = div;
     grid.appendChild(div);
   });
 }
@@ -492,7 +617,7 @@ $("cell-input").value = String(getCell());
 $("stash-lang").value = getLang();
 $("stash-lang").addEventListener("change", function () {
   localStorage.setItem("gdw.lang", this.value);
-  if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur].index);
+  if (stashState.pages.length) loadStashPage(stashState.pages[stashState.cur]);
   if (currentPath) showCharacter(currentPath);
 });
 
@@ -501,8 +626,17 @@ $("stash-btn").addEventListener("click", function () {
   this.classList.add("active");
   $("detail").style.display = "none";
   $("detail-empty").style.display = "none";
-  $("stash-view").style.display = "block";
+  $("stash-view").style.display = "flex";
   loadStash();
+});
+
+$("stash-grid-wrap").addEventListener("click", function (e) {
+  var hit = e.target && e.target.closest ? e.target.closest(".stash-item") : null;
+  if (hit && hit._item) {
+    selectItem(hit._item, "page=" + stashState.curPage + "&slot=" + hit._item.slot);
+  } else {
+    clearItemDetail();
+  }
 });
 
 $("stash-mode").addEventListener("change", function () {
@@ -510,6 +644,87 @@ $("stash-mode").addEventListener("change", function () {
   stashState.cur = 0;
   loadStash();
 });
+
+function selectItem(it, q) {
+  clearItemDetail();
+  stashState.selected = { q: q, it: it };
+  if (it._el) it._el.classList.add("selected");
+  loadItemDetail();
+}
+
+function clearItemDetail() {
+  stashState.selected = null;
+  document.querySelectorAll(".stash-item.selected, .catalog-list tr.selected")
+    .forEach(function (x) { x.classList.remove("selected"); });
+  var d = $("item-detail");
+  d.classList.remove("open");
+  d.innerHTML = "";
+}
+
+function loadItemDetail() {
+  var sel = stashState.selected;
+  if (!sel) return;
+  var d = $("item-detail");
+  d.classList.add("open");
+  d.innerHTML = "";
+  var head = document.createElement("div");
+  head.id = "item-detail-head";
+  var name = document.createElement("div");
+  name.id = "item-detail-name";
+  name.textContent = "...";
+  var sub = document.createElement("div");
+  sub.id = "item-detail-sub";
+  sub.textContent = "加载中...";
+  head.appendChild(name);
+  head.appendChild(sub);
+  var lines = document.createElement("div");
+  lines.id = "idetail-lines";
+  d.appendChild(head);
+  d.appendChild(lines);
+  fetch("/api/stash/item?mode=" + stashState.mode + "&" + sel.q + langParam())
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      if (stashState.selected !== sel) return;
+      name.textContent = data.name || "";
+      if (data.rarity && RARITY_COLORS[data.rarity]) name.style.color = RARITY_COLORS[data.rarity];
+      var parts = [];
+      if (data.rarity) parts.push(rarityText()[data.rarity] || data.rarity);
+      if (data.stackCount > 1) parts.push("叠堆 x" + data.stackCount);
+      if (data.w && data.h) {
+        parts.push("占地 " + (data.w === 1 && data.h === 1 ? "1x1" : data.w + "x" + data.h));
+      }
+      if (typeof sel.it.x === "number" && typeof sel.it.y === "number") {
+        parts.push("(" + sel.it.x + "," + sel.it.y + ")");
+      }
+      sub.textContent = parts.join(" - ");
+      renderItemDetailLines(lines, data.lines);
+    })
+    .catch(function (e) {
+      if (stashState.selected !== sel) return;
+      sub.textContent = "加载失败";
+      showError("加载物品详情失败: " + e.message);
+    });
+}
+
+function renderItemDetailLines(el, lines) {
+  el.innerHTML = "";
+  (lines || []).forEach(function (runs) {
+    var line = document.createElement("div");
+    line.className = "line";
+    if (!runs || !runs.length) {
+      line.classList.add("empty");
+      el.appendChild(line);
+      return;
+    }
+    runs.forEach(function (run) {
+      var sp = document.createElement("span");
+      if (run[1]) sp.className = run[1];
+      sp.textContent = run[0];
+      line.appendChild(sp);
+    });
+    el.appendChild(line);
+  });
+}
 
 $("cell-inc").addEventListener("click", function () { setCell(getCell() + 2); });
 $("cell-dec").addEventListener("click", function () { setCell(getCell() - 2); });
