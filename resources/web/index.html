@@ -625,7 +625,7 @@ function loadCharSackPage(page) {
     .then(function (data) {
       $("status").textContent = "角色背包 · " + (stashState.charInv ? stashState.charInv.name : "")
         + " · " + page.label + " · " + data.items.length + " 件 · 点击空白格可新增物品";
-      renderStashGrid(data, page.index);
+      renderStashGrid(data, page.index, "char-sack");
     })
     .catch(function (e) { showError("加载背包失败: " + e.message); });
 }
@@ -763,7 +763,7 @@ function renderCatalog(data) {
   grid.appendChild(tbl);
 }
 
-function renderStashGrid(data, index) {
+function renderStashGrid(data, index, kind) {
   var grid = $("stash-grid");
   var CELL = getCell();
   grid.style.setProperty("--cell", CELL + "px");
@@ -817,7 +817,7 @@ function renderStashGrid(data, index) {
     grid.appendChild(div);
   });
   stashState.pageDims = { width: data.width, height: data.height };
-  stashState.curPageKind = stashState._pageKind || "grid";
+  stashState.curPageKind = kind || "grid";
 }
 
 /* ---------- 新增物品选择器 ---------- */
