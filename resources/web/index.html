@@ -186,6 +186,7 @@
     <div id="detail-empty">请在左侧选择一个角色或「公共仓库」</div>
     <div id="detail" style="display:none">
       <div class="char-title" id="char-name"></div>
+      <button class="small-btn primary" id="inv-btn" style="margin-bottom:14px">查看背包</button>
       <table id="attr-table"></table>
     </div>
     <div id="stash-view" style="display:none">
@@ -347,6 +348,7 @@ function buildIronCell(td, value) {
 
 function showCharacter(path) {
   currentPath = path;
+  stashState.charPath = path;
   clearItemDetail();
   $("stash-view").style.display = "none";
   fetch("/api/character?path=" + encodeURIComponent(path) + langParam())
@@ -397,7 +399,8 @@ function langParam() { return "&lang=" + getLang(); }
 
 function rarityText() { return getLang() === "en" ? RARITY_TEXT_EN : RARITY_TEXT; }
 
-var stashState = { mode: "standard", pages: [], cur: 0, curPage: 0, catalogKind: "", selected: null };
+var stashState = { mode: "standard", pages: [], cur: 0, curPage: 0, catalogKind: "", selected: null,
+                   source: "stash", charPath: null, charInv: null };
 
 function pref(key, def) {
   var v = localStorage.getItem(key);
@@ -468,6 +471,8 @@ function renderStashTabs() {
 function loadStashPage(page) {
   clearItemDetail();
   stashState.curPage = page.index;
+  if (page.kind === "char-sack") { loadCharSackPage(page); return; }
+  if (page.kind === "equip" || page.kind === "weapon") { renderCharListPage(page); return; }
   if (page.kind && page.kind !== "grid") {
     loadCatalogPage(page);
     return;
@@ -492,6 +497,142 @@ function loadCatalogPage(page) {
       renderCatalog(data);
     })
     .catch(function (e) { showError("加载 " + page.label + " 失败: " + e.message); });
+}
+
+/* ---------- 角色背包（背包袋 + 穿戴 + 武器组） ---------- */
+
+function openCharInventory() {
+  if (!stashState.charPath) { showError("请先选择角色"); return; }
+  stashState.source = "char";
+  $("detail").style.display = "none";
+  $("detail-empty").style.display = "none";
+  $("stash-view").style.display = "flex";
+  $("stash-modes").style.display = "none";
+  loadCharInventory();
+}
+
+function loadCharInventory() {
+  clearItemDetail();
+  fetch("/api/character/inventory?path=" + encodeURIComponent(stashState.charPath) + langParam())
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      stashState.charInv = data;
+      stashState.pages = [];
+      (data.sacks || []).forEach(function (s) {
+        if (s.unused && !s.itemCount) return;
+        stashState.pages.push({ kind: "char-sack", index: s.index,
+                                label: s.unused ? "背包 " + (s.index + 1) + "（未解锁）"
+                                                : "背包 " + (s.index + 1),
+                                itemCount: s.itemCount });
+      });
+      var equip = (data.equipment || []).filter(function (e) { return e.baseName; });
+      if (equip.length) {
+        stashState.pages.push({ kind: "equip", index: -1, label: "装备", itemCount: equip.length });
+      }
+      (data.weaponSets || []).forEach(function (ws) {
+        var n = (ws.items || []).filter(function (e) { return e.baseName; }).length;
+        if (n) stashState.pages.push({ kind: "weapon", set: ws.set, index: -1,
+                                       label: "武器组 " + (ws.set + 1), itemCount: n });
+      });
+      if (!stashState.pages.length) {
+        var g = $("stash-grid");
+        g.innerHTML = '<div id="stash-empty">该角色背包为空</div>';
+        $("status").textContent = "角色背包 · " + (data.name || stashState.charPath) + " · 0 项";
+        return;
+      }
+      stashState.cur = 0;
+      renderStashTabs();
+      loadStashPage(stashState.pages[0]);
+    })
+    .catch(function (e) { showError("加载角色背包失败: " + e.message); });
+}
+
+function loadCharSackPage(page) {
+  clearItemDetail();
+  fetch("/api/character/inventory/page?path=" + encodeURIComponent(stashState.charPath)
+        + "&sack=" + page.index + langParam())
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) {
+      $("status").textContent = "角色背包 · " + (stashState.charInv ? stashState.charInv.name : "")
+        + " · " + page.label + " · " + data.items.length + " 件";
+      renderStashGrid(data, page.index);
+    })
+    .catch(function (e) { showError("加载背包失败: " + e.message); });
+}
+
+function renderCharListPage(page) {
+  clearItemDetail();
+  stashState.catalogKind = null;
+  var rows;
+  if (page.kind === "equip") {
+    rows = (stashState.charInv.equipment || []).map(function (e) {
+      return { it: e, q: "source=equip&slot=" + e.slot, has: !!e.baseName };
+    });
+  } else {
+    var ws = (stashState.charInv.weaponSets || [])[page.set] || { items: [] };
+    rows = (ws.items || []).map(function (e, i) {
+      return { it: e, q: "source=weapon&set=" + page.set + "&slot=" + i, has: !!e.baseName };
+    });
+  }
+  renderCharList(rows, page.label);
+}
+
+function renderCharList(rows, label) {
+  var grid = $("stash-grid");
+  grid.style.width = "";
+  grid.style.height = "";
+  grid.style.backgroundColor = "rgba(255,255,255,0.035)";
+  grid.innerHTML = "";
+  $("status").textContent = "角色背包 · " + (stashState.charInv ? stashState.charInv.name : "")
+    + " · " + label;
+  var tbl = document.createElement("table");
+  tbl.className = "catalog-list";
+  var thead = document.createElement("thead");
+  var hr = document.createElement("tr");
+  ["槽位", "名称", "稀有度", "叠堆"].forEach(function (h) {
+    var th = document.createElement("th");
+    th.textContent = h;
+    hr.appendChild(th);
+  });
+  thead.appendChild(hr);
+  tbl.appendChild(thead);
+  var tbody = document.createElement("tbody");
+  rows.forEach(function (row) {
+    var it = row.it;
+    var tr = document.createElement("tr");
+    var rarity = it.rarity;
+    if (pref("gdw.showRarity", true) && rarity && RARITY_COLORS[rarity]) {
+      tr.style.borderLeft = "3px solid " + RARITY_COLORS[rarity];
+    }
+    var cSlot = document.createElement("td");
+    cSlot.textContent = it.label || "";
+    tr.appendChild(cSlot);
+    var cName = document.createElement("td");
+    if (pref("gdw.showName", true) && it.name) cName.textContent = it.name;
+    tr.appendChild(cName);
+    var cRarity = document.createElement("td");
+    var rt = rarityText()[rarity] || rarity || "";
+    if (pref("gdw.showRarityText", true) && rt) {
+      cRarity.textContent = rt;
+      if (RARITY_COLORS[rarity]) cRarity.style.color = RARITY_COLORS[rarity];
+    }
+    tr.appendChild(cRarity);
+    var cCount = document.createElement("td");
+    cCount.textContent = it.stackCount > 1 ? "×" + it.stackCount : "";
+    tr.appendChild(cCount);
+    if (row.has) {
+      tr.title = [it.label, it.name, "稀有度: " + (rarityText()[rarity] || rarity)].join(" | ");
+      tr._item = it;
+      tr._el = tr;
+      tr.addEventListener("click", function () { selectItem(it, row.q); });
+    } else {
+      tr.style.opacity = "0.45";
+      tr.title = it.label + "（空）";
+    }
+    tbody.appendChild(tr);
+  });
+  tbl.appendChild(tbody);
+  grid.appendChild(tbl);
 }
 
 function renderCatalog(data) {
@@ -624,16 +765,26 @@ $("stash-lang").addEventListener("change", function () {
 $("stash-btn").addEventListener("click", function () {
   document.querySelectorAll(".char.active").forEach(function (x) { x.classList.remove("active"); });
   this.classList.add("active");
+  stashState.source = "stash";
+  stashState.charInv = null;
+  $("stash-modes").style.display = "";
   $("detail").style.display = "none";
   $("detail-empty").style.display = "none";
   $("stash-view").style.display = "flex";
   loadStash();
 });
 
+$("inv-btn").addEventListener("click", function () {
+  openCharInventory();
+});
+
 $("stash-grid-wrap").addEventListener("click", function (e) {
   var hit = e.target && e.target.closest ? e.target.closest(".stash-item") : null;
   if (hit && hit._item) {
-    selectItem(hit._item, "page=" + stashState.curPage + "&slot=" + hit._item.slot);
+    var q = stashState.source === "char"
+      ? "source=sack&sack=" + stashState.curPage + "&slot=" + hit._item.slot
+      : "page=" + stashState.curPage + "&slot=" + hit._item.slot;
+    selectItem(hit._item, q);
   } else {
     clearItemDetail();
   }
@@ -681,7 +832,9 @@ function loadItemDetail() {
   lines.id = "idetail-lines";
   d.appendChild(head);
   d.appendChild(lines);
-  fetch("/api/stash/item?mode=" + stashState.mode + "&" + sel.q + langParam())
+  fetch((stashState.source === "char"
+         ? "/api/character/inventory/item?path=" + encodeURIComponent(stashState.charPath) + "&"
+         : "/api/stash/item?mode=" + stashState.mode + "&") + sel.q + langParam())
     .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
     .then(function (data) {
       if (stashState.selected !== sel) return;

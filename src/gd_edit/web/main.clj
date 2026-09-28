@@ -389,12 +389,12 @@
      :mode mode
      :file path
      :has-hardcore (.isFile (io/file (stash-file-path "hardcore")))
-     :extra (vec (keep (fn [kind]
-                         (when-let [paths (catalog-items kind mode)]
-                           {:kind kind
-                            :label (get catalog-kind-labels kind kind)
-                            :itemCount (count paths)}))
-                       catalog-kinds))
+      :extra (vec (keep (fn [kind]
+                          (when-let [records (catalog-items kind mode)]
+                            {:kind kind
+                             :label (get catalog-kind-labels kind kind)
+                             :itemCount (count records)}))
+                        catalog-kinds))
      :pages (->> (:stash s)
                  (map-indexed
                   (fn [idx sack]
@@ -425,6 +425,11 @@
 (def ^:private catalog-kind-labels
   {"reagents" "镶嵌物·材料"})
 
+;; 角色装备槽位（GD 1.3 档案 block3 equipment 数组顺序，实测 _purple 验证）。
+(def ^:private char-equipment-labels
+  ["头盔" "项链" "胸甲" "腿甲" "鞋" "手套"
+   "戒指1" "戒指2" "腰带" "肩甲" "勋章" "神器"])
+
 (defn- catalog-file-path
   [mode kind]
   (str (io/file (stash-save-root) (str kind (if (= mode "hardcore") ".gsh" ".gst")))))
@@ -432,28 +437,28 @@
 (def ^:private catalog-cache (atom {}))
 
 (defn- catalog-items
-  "解析并缓存目录附页的物品路径（按 [文件+mtime] 缓存）。"
+  "解析并缓存目录附页的记录（按 [文件+mtime] 缓存），records 含 :path/:count。"
   [kind mode]
   (let [f (io/file (catalog-file-path mode kind))]
     (when (.isFile f)
       (let [key (str (catalog-file-path mode kind) ":" (.lastModified f))
             hit (get @catalog-cache key ::missing)]
         (if (identical? hit ::missing)
-          (let [paths (try (:item-paths (st/load-catalog-file (.getPath f)))
-                           (catch Throwable _ nil))]
-            (swap! catalog-cache assoc key paths)
-            paths)
+          (let [records (try (:records (st/load-catalog-file (.getPath f)))
+                             (catch Throwable _ nil))]
+            (swap! catalog-cache assoc key records)
+            records)
           hit)))))
 
 (defn- catalog-page-payload
   [kind mode lang]
   (ensure-gdx3-loaded!)
   (let [table (lang-table lang)]
-    (when-let [paths (catalog-items kind mode)]
+    (when-let [records (catalog-items kind mode)]
       {:kind kind
        :label (get catalog-kind-labels kind kind)
-       :itemCount (count paths)
-       :items (mapv (fn [path]
+       :itemCount (count records)
+       :items (mapv (fn [{:keys [path count]}]
                       (let [it {:basename path}]
                         {:name (or (strip-color-codes
                                     (resolve-tokens (try (dbu/item-name it) (catch Throwable _ nil))
@@ -461,8 +466,109 @@
                                    (last (str/split path #"/")))
                          :baseName path
                          :rarity (item-rarity path)
-                         :count 1}))
-                    paths)})))
+                         :count (or count 1)}))
+                    records)})))
+
+;;------------------------------------------------------------------------------
+;; 角色背包（只读查看）：背包袋 + 穿戴装备 + 备用武器组
+;;------------------------------------------------------------------------------
+
+(defn- char-item-summary
+  "物品摘要（装备/武器组列表用）：名称、稀有度、叠堆。"
+  [item table]
+  (let [nm (try (dbu/item-name item) (catch Throwable _ nil))]
+    {:name (strip-color-codes (resolve-tokens nm table))
+     :baseName (:basename item)
+     :rarity (item-rarity (:basename item))
+     :stackCount (:stack-count item)}))
+
+(defn- char-sack-items-payload
+  "角色背包袋物品：坐标是普通整数（勿用共享仓库的 slot-coord 浮点位解码）。"
+  [items table]
+  (mapv (fn [idx it]
+          (let [nm (try (dbu/item-name it) (catch Throwable _ nil))]
+            {:slot idx
+             :name (strip-color-codes (resolve-tokens nm table))
+             :baseName (:basename it)
+             :stackCount (:stack-count it)
+             :x (:X it)
+             :y (:Y it)
+             :w (:width (stash-item-dims it))
+             :h (:height (stash-item-dims it))
+             :rarity (item-rarity (:basename it))
+             :prefixName (strip-color-codes (affix-name (:prefix-name it)))
+             :suffixName (strip-color-codes (affix-name (:suffix-name it)))}))
+        (range)
+        items))
+
+(defn- sack-slot-dims
+  "背包袋格数：袋0 用 inventory_grid0.dbr，其余用 grid1（取自 DB）。"
+  [idx]
+  (try (inv/inv-slot-dims [:inventory-sacks idx])
+       (catch Throwable _ nil)))
+
+(defn- character-inventory-payload
+  [path lang]
+  (ensure-gdx3-loaded!)
+  (let [c (gdc/load-character-file path)
+        table (lang-table lang)
+        sacks (mapv (fn [idx sack]
+                      (let [dims (sack-slot-dims idx)]
+                        {:index idx
+                         :unused (:unused sack)
+                         :itemCount (count (:inventory-items sack))
+                         :width (:width dims)
+                         :height (:height dims)}))
+                    (range) (:inventory-sacks c))]
+    {:name (:character-name c)
+     :path path
+     :sacks sacks
+     :equipment (mapv (fn [idx item]
+                        (merge (char-item-summary item table)
+                               {:slot idx
+                                :label (get char-equipment-labels idx
+                                            (str "装备位 " (inc idx)))}))
+                      (range) (:equipment c))
+     :weaponSets (mapv (fn [set-idx ws]
+                         {:set set-idx
+                          :unused (:unused ws)
+                          :items (mapv (fn [idx item]
+                                         (merge (char-item-summary item table)
+                                                {:slot idx
+                                                 :label (if (zero? idx) "主手" "副手")}))
+                                       (range) (:items ws))})
+                       (range) (:weapon-sets c))}))
+
+(defn- character-inv-page-payload
+  [path sack-index lang]
+  (when-let [sack (nth (:inventory-sacks (gdc/load-character-file path))
+                       sack-index nil)]
+    (ensure-gdx3-loaded!)
+    (let [dims (sack-slot-dims sack-index)]
+      {:width (:width dims)
+       :height (:height dims)
+       :items (char-sack-items-payload (:inventory-items sack) (lang-table lang))})))
+
+(defn- has-item?
+  [it]
+  (and it (not (str/blank? (:basename it)))))
+
+(defn- character-inv-item-payload
+  [path source sack-index set-index slot-index lang]
+  (let [c (gdc/load-character-file path)]
+    (case source
+      "sack" (let [sack (nth (:inventory-sacks c) sack-index nil)]
+               (when-let [it (and sack (nth (:inventory-items sack) slot-index nil))]
+                 (when (has-item? it)
+                   (item-detail-payload it (lang-table lang)))))
+      "equip" (when-let [it (nth (:equipment c) slot-index nil)]
+                (when (has-item? it)
+                  (item-detail-payload it (lang-table lang))))
+      "weapon" (when-let [ws (nth (:weapon-sets c) set-index nil)]
+                 (when-let [it (nth (:items ws) slot-index nil)]
+                   (when (has-item? it)
+                     (item-detail-payload it (lang-table lang)))))
+      nil)))
 
 (defn- parse-query-param
   [query key]
@@ -520,6 +626,68 @@
 
         (= path "/api/character/money")
         (send-json! exchange 405 {:error "method not allowed"})
+
+        (and (= path "/api/character/inventory") query)
+        (let [p (parse-query-param query "path")
+              lang (or (parse-query-param query "lang") "zh")]
+          (cond
+            (not (and (string? p) (.isFile (io/file p))))
+            (send-json! exchange 400 {:error "无效的角色档案路径"})
+
+            :else
+            (try
+              (send-json! exchange 200 (character-inventory-payload p lang))
+              (catch Throwable e
+                (send-json! exchange 500 {:error (str e)})))))
+
+        (and (= path "/api/character/inventory/page") query)
+        (let [p (parse-query-param query "path")
+              lang (or (parse-query-param query "lang") "zh")
+              sack (parse-int-param query "sack" nil)]
+          (cond
+            (not (and (string? p) (.isFile (io/file p))))
+            (send-json! exchange 400 {:error "无效的角色档案路径"})
+
+            (nil? sack)
+            (send-json! exchange 400 {:error "缺少合法的 sack 参数"})
+
+            :else
+            (try
+              (if-let [data (character-inv-page-payload p sack lang)]
+                (send-json! exchange 200 data)
+                (send-json! exchange 404 {:error (str "背包袋不存在: " sack)}))
+              (catch Throwable e
+                (send-json! exchange 500 {:error (str e)})))))
+
+        (and (= path "/api/character/inventory/item") query)
+        (let [p (parse-query-param query "path")
+              lang (or (parse-query-param query "lang") "zh")
+              source (or (parse-query-param query "source") "sack")
+              sack (parse-int-param query "sack" nil)
+              set (parse-int-param query "set" nil)
+              slot (parse-int-param query "slot" nil)]
+          (cond
+            (not (and (string? p) (.isFile (io/file p))))
+            (send-json! exchange 400 {:error "无效的角色档案路径"})
+
+            (not (contains? #{"sack" "equip" "weapon"} source))
+            (send-json! exchange 400 {:error "未知的 source（应为 sack/equip/weapon）"})
+
+            (= source "weapon")
+            (do
+              (if (and (some? set) (some? slot))
+                (if-let [data (character-inv-item-payload p source sack set slot lang)]
+                  (send-json! exchange 200 data)
+                  (send-json! exchange 404 {:error "物品不存在"}))
+                (send-json! exchange 400 {:error "缺少 set/slot 参数"})))
+
+            (nil? slot)
+            (send-json! exchange 400 {:error "缺少 slot 参数"})
+
+            :else
+            (if-let [data (character-inv-item-payload p source sack nil slot lang)]
+              (send-json! exchange 200 data)
+              (send-json! exchange 404 {:error "物品不存在"}))))
 
         (and (= path "/api/stash")
              (or (nil? query) (not (str/includes? query "index"))))

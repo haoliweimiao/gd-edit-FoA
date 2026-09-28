@@ -174,6 +174,7 @@
            (recur (inc j))))))
 
 (defn- catalog-decode-path
+  "解码掩码路径，返回 [路径 尾随数据起点pe]（pe = `.dbr` 末尾在 raw 中的位置）。"
   [raw i k]
   (let [n (count raw)
         sb (java.lang.StringBuilder.)]
@@ -185,10 +186,11 @@
     (let [s (str sb)
           idx (.indexOf s ".dbr")]
       (when (>= idx 0)
-        (subs s 0 (+ idx 4))))))
+        [(subs s 0 (+ idx 4)) (+ i idx 4)]))))
 
-(defn- extract-catalog-paths
-  "从解密后内容中逐串自检出全部物品 dbr 路径。"
+(defn- extract-catalog-records
+  "从解密后内容中逐串自检出全部物品记录。返回 [{:path \"...dbr\" :start 记录首字节 :count N}]，
+  其中 count 为记录尾随数据首字节 ^ k（已验证 = 数量低 8 位）。"
   [^bytes content]
   (let [raw (mapv #(bit-and 0xff (long %)) content)
         n (count raw)
@@ -199,8 +201,12 @@
         (persistent! acc)
         (let [k (bit-xor (nth raw i) (nth catalog-needle 0))]
           (if (catalog-needle-at? raw i k)
-            (if-let [path (catalog-decode-path raw i k)]
-              (recur (+ i m 1) (conj! acc path))
+            (if-let [[path pe] (catalog-decode-path raw i k)]
+              (recur (+ i m 1)
+                     (conj! acc {:path path
+                                 :start i
+                                 :count (when (< pe n)
+                                          (bit-and 0xff (bit-xor (nth raw pe) k)))}))
               (recur (inc i) acc))
             (recur (inc i) acc)))))))
 
@@ -226,11 +232,12 @@
           ;; 注：内容中 int 字段按大端倒序推进状态、字符串字节按顺序推进，二者混合；
           ;; 批量按顺序解密会导致整体状态与真实读写偏离，故校验和仅作参考不强制。
           checksum (Integer/toUnsignedLong (.getInt bb))
-          paths (extract-catalog-paths content)]
+          records (extract-catalog-records content)]
       {:meta-catalog-id id
        :meta-checksum-match (= checksum (:enc-state @enc-context))
-       :item-paths paths
-       :items (count paths)})))
+       :item-paths (mapv :path records)
+       :records records
+       :items (count records)})))
 
 (defn write-stash-file
   [stash savepath]
