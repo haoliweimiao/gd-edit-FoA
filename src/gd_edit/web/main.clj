@@ -685,6 +685,62 @@
              :item {:baseName new-baseName :x x :y y :count qty}}
             (throw (ex-info "写入校验失败，数据未新增" {:status 500}))))))))
 
+(defn- delete-char-item!
+  "删除角色背包袋 slot 处的物品（先备份，写档后重载校验数量减一且被删物品三元组消失）。"
+  [path sack-index slot]
+  (let [c (gdc/load-character-file path)
+        sack (nth (:inventory-sacks c) sack-index nil)
+        items (:inventory-items sack)]
+    (when (nil? sack)
+      (throw (ex-info "背包袋不存在" {:status 400})))
+    (when (or (nil? slot) (not (integer? slot)) (neg? slot) (>= slot (count items)))
+      (throw (ex-info "无效的物品槽位" {:status 400})))
+    (let [it (nth items slot nil)]
+      (when (or (nil? it) (str/blank? (:basename it)))
+        (throw (ex-info "该位置没有物品" {:status 400})))
+      (let [removed {:basename (:basename it) :x (:X it) :y (:Y it)}
+            backup (backup-copy! path)
+            c2 (update-in c [:inventory-sacks sack-index :inventory-items]
+                          (fn [v] (into (subvec v 0 slot) (subvec v (inc slot)))))]
+        (gdc/write-character-file c2 path)
+        (let [items' (get-in (gdc/load-character-file path)
+                             [:inventory-sacks sack-index :inventory-items])]
+          (if (and (= (clojure.core/count items') (dec (clojure.core/count items)))
+                   (not-any? (fn [x] (and (= (:basename x) (:basename removed))
+                                          (= (:X x) (:x removed))
+                                          (= (:Y x) (:y removed))))
+                             items'))
+            {:ok true :backup backup :removed (:basename it)}
+            (throw (ex-info "写入校验失败，物品未删除" {:status 500}))))))))
+
+(defn- handle-inventory-item-delete
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        sack (:sack body)
+        slot (:slot body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (and (integer? sack) (<= 0 sack)))
+      (send-json! exchange 400 {:ok false :error "无效的背包袋序号"})
+
+      (not (and (integer? slot) (<= 0 slot)))
+      (send-json! exchange 400 {:ok false :error "无效的物品槽位"})
+
+      :else
+      (try
+        (send-json! exchange 200 (delete-char-item! path sack slot))
+        (catch clojure.lang.ExceptionInfo e
+          (send-json! exchange (or (:status (ex-data e)) 500)
+                      {:ok false :error (.getMessage e)}))
+        (catch Throwable e
+          (send-json! exchange 500 {:ok false :error (str e)}))))))
+
 (defn- handle-inventory-item-post
   [exchange]
   (let [body (money-request-payload exchange)
@@ -826,6 +882,9 @@
 
         (and (= path "/api/character/inventory/item") (= method "POST"))
         (handle-inventory-item-post exchange)
+
+        (and (= path "/api/character/inventory/item/delete") (= method "POST"))
+        (handle-inventory-item-delete exchange)
 
         (and (= path "/api/character/inventory/item") query)
         (let [p (parse-query-param query "path")

@@ -79,6 +79,8 @@
   }
   .small-btn:hover { border-color: var(--accent); }
   .small-btn.primary { border-color: var(--accent); color: #cfe4ff; }
+  .small-btn.danger { border-color: var(--danger); color: #e58a8d; }
+  .small-btn.danger:hover { background: var(--danger); color: #fff; }
   .small-btn:disabled { opacity: 0.5; cursor: default; }
 
   /* ---- 公共仓库 ---- */
@@ -93,7 +95,7 @@
     border-radius: 6px; padding: 14px; overflow-y: auto;
   }
   #item-detail.open { display: block; }
-  #item-detail-head { padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
+  #item-detail-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 8px; padding-bottom: 10px; border-bottom: 1px solid var(--border); margin-bottom: 10px; }
   #item-detail-name { font-size: 15px; font-weight: 600; word-break: break-word; }
   #item-detail-sub { color: var(--muted); font-size: 12px; margin-top: 5px; line-height: 1.5; }
   #idetail-lines { font-size: 13px; line-height: 1.55; }
@@ -1023,6 +1025,30 @@ function selectItem(it, q) {
   loadItemDetail();
 }
 
+function deleteSackItem(sel) {
+  var it = sel.it;
+  var label = it.name || it.baseName || "该物品";
+  if (!confirm("确定要从背包袋中删除“" + label + "”吗？\n删除前会自动备份，可通过备份恢复。")) return;
+  fetch("/api/character/inventory/item/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: stashState.charPath, sack: stashState.curPage, slot: it.slot })
+  })
+    .then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    })
+    .then(function (res) {
+      if (res.ok && res.d.ok) {
+        showToast("已删除（备份: " + res.d.backup + "）");
+        clearItemDetail();
+        loadStashPage(stashState.pages[stashState.cur]);
+      } else {
+        showError((res.d && res.d.error) || "删除失败");
+      }
+    })
+    .catch(function (e) { showError("删除失败: " + e.message); });
+}
+
 function clearItemDetail() {
   stashState.selected = null;
   document.querySelectorAll(".stash-item.selected, .catalog-list tr.selected")
@@ -1040,14 +1066,17 @@ function loadItemDetail() {
   d.innerHTML = "";
   var head = document.createElement("div");
   head.id = "item-detail-head";
+  var headMain = document.createElement("div");
+  headMain.style.cssText = "flex:1;min-width:0";
   var name = document.createElement("div");
   name.id = "item-detail-name";
   name.textContent = "...";
   var sub = document.createElement("div");
   sub.id = "item-detail-sub";
   sub.textContent = "加载中...";
-  head.appendChild(name);
-  head.appendChild(sub);
+  headMain.appendChild(name);
+  headMain.appendChild(sub);
+  head.appendChild(headMain);
   var lines = document.createElement("div");
   lines.id = "idetail-lines";
   d.appendChild(head);
@@ -1071,6 +1100,14 @@ function loadItemDetail() {
       }
       sub.textContent = parts.join(" - ");
       renderItemDetailLines(lines, data.lines);
+      if (stashState.source === "char" && sel.q.indexOf("source=sack") === 0) {
+        var del = document.createElement("button");
+        del.className = "small-btn danger";
+        del.textContent = "删除";
+        del.title = "从背包袋中移除该物品（写入前自动备份）";
+        del.addEventListener("click", function () { deleteSackItem(sel); });
+        head.appendChild(del);
+      }
     })
     .catch(function (e) {
       if (stashState.selected !== sel) return;
