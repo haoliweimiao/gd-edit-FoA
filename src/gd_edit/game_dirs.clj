@@ -25,10 +25,37 @@
                                         "SOFTWARE\\Valve\\Steam"
                                         "SteamPath")))
 
-(defn get-steam-library-folders
-  "Retrieves the library folders as defined in steamapps/libraryfolders.vdf"
+(def ^:private steam-app-id "219990")
+
+(defn- linux-steam-roots
+  "Common locations of the Steam installation on Linux. Roots are dereferenced
+  to canonical paths and deduplicated (several, e.g. ~/.steam/steam and
+  ~/.steam/root, are symlinks to the same directory)."
   []
-  (let [lib-folder-file (io/file (get-steam-path) "steamapps/libraryfolders.vdf")]
+  (->> ["~/.steam/steam"
+        "~/.local/share/Steam"
+        "~/.var/app/com.valvesoftware.Steam/data/Steam"
+        "~/.steam/root"
+        "/usr/share/steam"]
+       (map u/expand-home)
+       (filter u/path-exists?)
+       (map (fn [p] (try (.getCanonicalPath (io/file p)) (catch Throwable _ p))))
+       (distinct)
+       (vec)))
+
+(defn- steam-roots
+  "Candidate Steam installation roots across platforms."
+  []
+  (cond
+    (u/running-windows?) [(get-steam-path)]
+    (u/running-linux?)   (linux-steam-roots)
+    :else []))
+
+(defn- steam-library-folders-under
+  "Retrieves the library folders as defined in steamapps/libraryfolders.vdf
+  under a given steam root."
+  [steam-root]
+  (let [lib-folder-file (io/file steam-root "steamapps/libraryfolders.vdf")]
     (when (.exists lib-folder-file)
       (as-> lib-folder-file $
         (vdf/parse $)
@@ -44,21 +71,38 @@
         (map #(get % "path") $)
         ))))
 
+(defn get-steam-library-folders
+  "Retrieves the library folders as defined in each steamapps/libraryfolders.vdf"
+  []
+  (mapcat steam-library-folders-under (steam-roots)))
+
+(defn- dropbox-gd-dir
+  "Legacy macOS Dropbox game dir, only when it actually exists."
+  []
+  (let [d (u/expand-home "~/Dropbox/Public/GrimDawn")]
+    (when (u/path-exists? d) d)))
+
+(defn- steam-game-dirs
+  "Game dirs under steam roots and library folders (cross-platform separators)."
+  []
+  (->> (concat (steam-roots) (get-steam-library-folders))
+       (remove nil?)
+       (map #(str (io/file % "steamapps" "common" "Grim Dawn")))))
+
 (defn- standard-game-dirs
   "Get the game's expected installation paths"
   []
 
   (cond
     (u/running-osx?)
-    [(u/expand-home "~/Dropbox/Public/GrimDawn")]
+    (->> [(dropbox-gd-dir)]
+         (remove nil?))
 
     (u/running-linux?)
-    [""]
+    (steam-game-dirs)
 
     :else
-    (->> (concat [(get-steam-path)] (get-steam-library-folders))
-         (remove nil?)
-         (map #(str % "\\steamapps\\common\\Grim Dawn")))))
+    (steam-game-dirs)))
 
 (defn- clean-list
   "Removes nil from collection and return a list"
@@ -80,16 +124,18 @@
    (clean-list (into [(get settings :game-dir)] (standard-game-dirs)))))
 
 (defn get-steam-cloud-save-dirs
+  "Steam userdata cloud save roots across platforms."
   []
-
-  (when (u/running-windows?)
-    (let [userdata-dir (io/file (get-steam-path) "userdata")]
-      (->> (io/file userdata-dir)
-           (.listFiles)
-           (filter #(.isDirectory %1))
-           (map #(io/file % "219990\\remote\\save\\main"))
-           (filter #(.exists %))
-           (map #(.getPath %))))))
+  (->> (steam-roots)
+       (map #(io/file % "userdata"))
+       (filter #(.isDirectory %))
+       (mapcat (fn [userdata-dir]
+                 (->> (.listFiles userdata-dir)
+                      (filter #(.isDirectory %))
+                      (map (fn [f] (io/file f steam-app-id "remote" "save" "main"))))))
+       (filter #(.exists %))
+       (map #(.getPath %))
+       (vec)))
 
 (declare get-game-dir)
 
@@ -98,7 +144,8 @@
 
   (cond
     (u/running-osx?)
-    (u/expand-home "~/Dropbox/Public/GrimDawn/main")
+    (when-let [gd (dropbox-gd-dir)]
+      (str (io/file gd "main")))
 
     (u/running-linux?)
     (or (get @globals/settings :save-dir) "")
@@ -106,17 +153,26 @@
     :else
     (.getPath (io/file (u/home-dir) "Documents\\My Games\\Grim Dawn\\save\\main"))))
 
+(defn- canonical-path
+  [path]
+  (try (.getCanonicalPath (io/file path)) (catch Throwable _ path)))
+
 (defn get-save-dir-search-list
   "Returns all possible locations where the save dir might be found.
+  Entries are canonicalized so symlinked layouts (e.g. ~/.steam/steam and
+  ~/.steam/root) collapse to their real directory.
 
   Note that this function respects the :save-dir setting in the user's setting.edn file."
   []
-
   (cond
     (u/running-osx?)
-    (clean-list [(get @globals/settings :save-dir) (get-local-save-dir)])
+    (clean-list (map canonical-path
+                     [(get @globals/settings :save-dir) (get-local-save-dir)]))
+
     :else
-    (clean-list (concat [(get @globals/settings :save-dir) (get-local-save-dir)] (get-steam-cloud-save-dirs)))))
+    (clean-list (map canonical-path
+                     (concat [(get @globals/settings :save-dir) (get-local-save-dir)]
+                             (get-steam-cloud-save-dirs))))))
 
 (defn save-dir->mod-save-dir
   [save-dir]
@@ -170,6 +226,11 @@
   []
   (io/file (get-game-dir) "gdx2"))
 
+(defn get-gdx3-dir
+  "Returns the directory for Fangs of Asterkarn dlc."
+  []
+  (io/file (get-game-dir) "gdx3"))
+
 (defn get-mod-dir
   "Returns the configured mod's directory"
   []
@@ -181,6 +242,7 @@
   [(get-game-dir)
    (get-gdx1-dir)
    (get-gdx2-dir)
+   (get-gdx3-dir)
    (get-mod-dir)])
 
 (defn files-with-extension

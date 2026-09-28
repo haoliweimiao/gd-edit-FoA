@@ -19,30 +19,19 @@
            [java.net InetSocketAddress URLDecoder]
            [java.nio.charset StandardCharsets]))
 
-(def ^:private port 8787)
+(def ^:private port
+  (try (Long/parseLong (or (System/getenv "GD_EDIT_PORT") "8787"))
+       (catch Exception _ 8787)))
 (def ^:private base-url (str "http://127.0.0.1:" port))
 (def ^:private local-en (atom {}))
 (def ^:private local-zh (atom {}))
 (def ^:private local-zh-merged (atom {}))
 (def ^:private page-html (atom nil))
 
-(def ^:private en-files
-  ["resources/Text_EN.arc"
-   "gdx1/resources/Text_EN.arc"
-   "gdx2/resources/Text_EN.arc"
-   "gdx3/resources/Text_EN.arc"])
-
-(def ^:private zh-files
-  ["resources/Text_ZH.arc"
-   "gdx1/resources/Text_ZH.arc"
-   "gdx2/resources/Text_ZH.arc"
-   "gdx3/resources/Text_ZH.arc"])
-
 (defn- load-lang-table!
-  [files]
+  [relative-path]
   (try
-    (->> (map #(io/file (dirs/get-game-dir) %) files)
-         (filter #(.isFile %))
+    (->> (dirs/get-file-and-overrides relative-path)
          (map arc/load-localization-table)
          (apply merge {}))
     (catch Throwable _ {})))
@@ -74,8 +63,8 @@
   "载入游戏英/中词表用于解析名称 tag，失败时静默降级为空表。
   中文合并时跳过空串条目：中文包未翻译（空值）的词条回退英文。"
   []
-  (reset! local-en (load-lang-table! en-files))
-  (reset! local-zh (merge (load-lang-table! zh-files)
+  (reset! local-en (load-lang-table! "resources/Text_EN.arc"))
+  (reset! local-zh (merge (load-lang-table! "resources/Text_ZH.arc")
                           (load-txt-l10n-map (str (io/file (dirs/get-game-dir)
                                                            "Settings/text_zh")))))
   (reset! local-zh-merged
@@ -245,8 +234,9 @@
   (when-not @gdx3-loaded
     (locking gdx3-loaded
       (when-not @gdx3-loaded
-        (let [gdx3-db (io/file (dirs/get-game-dir) "gdx3/database/GDX3.arz")
-              gdx3-tex (io/file (dirs/get-game-dir) "gdx3/resources/Items.arc")]
+        (let [gdx3-dir (dirs/get-gdx3-dir)
+              gdx3-db (io/file gdx3-dir "database/GDX3.arz")
+              gdx3-tex (io/file gdx3-dir "resources/Items.arc")]
           ;; 等待基础 DB（含本地化）加载完成
           ;; globals/db 等根值为 future；全库用 @ 读取，须保持 IDeref(future) 语义，
           ;; 因此以「新 future 把 gdx3 合并进基础数据」替代根值。
