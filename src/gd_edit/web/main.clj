@@ -447,11 +447,11 @@
   [s]
   (when s (-> s (str/replace #"\^[A-Za-z]" "") (str/replace #"[<>]" ""))))
 
-(defn- item-detail-runs
-  "item-summary 输出（去掉首行名称）逐行转为 [[text class] ...]；文本本地化并去 GD 标记。"
-  [item table]
+(defn- effect-runs
+  "isummary 输出行序列 → [[text class] ...]（本地化、去 GD 标记）。供详情与词缀属性共用。"
+  [lines table]
   (try
-    (->> (rest (isummary/item-summary item))
+    (->> lines
          (mapv (fn [line]
                  (->> (ansi-runs line)
                       (mapv (fn [[text color]]
@@ -459,8 +459,14 @@
                                (when color (name color))]))))))
     (catch Throwable _ [])))
 
+(defn- item-detail-runs
+  "item-summary 输出（去掉首行名称）逐行转为 [[text class] ...]；文本本地化并去 GD 标记。"
+  [item table]
+  (effect-runs (rest (isummary/item-summary item)) table))
+
 (defn- affix-paths-payload
-  "合法词缀集合 → [{path name level}]（名称本地化，按名称排序）。"
+  "合法词缀集合 → [{path name level lines}]（名称本地化，按名称排序）。
+   level 取词缀记录 levelRequirement（词缀无 itemLevel，可能为 nil）；lines 为该词缀属性逐行。"
   [paths table]
   (->> paths
        (keep (fn [p]
@@ -469,9 +475,17 @@
                    {:path p
                     :name (strip-color-codes
                            (resolve-tokens (if (str/blank? nm) p nm) table))
-                    :level (get rec "itemLevel")}))))
+                    :level (get rec "levelRequirement")
+                    :lines (effect-runs (isummary/effect-summary rec) table)}))))
        (sort-by (comp str/lower-case :name))
        (vec)))
+
+(defn- affix-level
+  "给定词缀 dbr 路径 → 其等级（levelRequirement）；词缀无 itemLevel。可能 nil。"
+  [path]
+  (when-let [rec (and path (not (str/blank? path)) (get @globals/db-index path))]
+    (let [v (get rec "levelRequirement")]
+      (when (and v (number? v)) v))))
 
 (defn- item-detail-payload
   [it table]
@@ -487,6 +501,8 @@
      :lines (item-detail-runs it table)
      :prefixPath (:prefix-name it)
      :suffixPath (:suffix-name it)
+     :prefixLevel (affix-level (:prefix-name it))
+     :suffixLevel (affix-level (:suffix-name it))
      :validAffixes {:prefix (affix-paths-payload (:prefix va) table)
                     :suffix (affix-paths-payload (:suffix va) table)}}))
 
