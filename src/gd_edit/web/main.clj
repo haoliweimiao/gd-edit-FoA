@@ -322,6 +322,12 @@
   (when-let [rec (get (dbu/db-recordname-index) basename)]
     (get rec "itemClassification")))
 
+(defn- item-level
+  [basename]
+  (when-let [rec (get (dbu/db-recordname-index) basename)]
+    (let [v (get rec "itemLevel")]
+      (when (and v (number? v)) v))))
+
 (defn- stash-item-dims
   [item]
   (try
@@ -397,6 +403,7 @@
                :w (:width (stash-item-dims it))
                :h (:height (stash-item-dims it))
                :rarity (item-rarity (:basename it))
+               :level (item-level (:basename it))
                :prefixName (strip-color-codes (affix-name (:prefix-name it)))
                :suffixName (strip-color-codes (affix-name (:suffix-name it)))}))
            (range)
@@ -603,6 +610,7 @@
              :w (:width (stash-item-dims it))
              :h (:height (stash-item-dims it))
              :rarity (item-rarity (:basename it))
+             :level (item-level (:basename it))
              :prefixName (strip-color-codes (affix-name (:prefix-name it)))
              :suffixName (strip-color-codes (affix-name (:suffix-name it)))}))
         (range)
@@ -724,6 +732,7 @@
                       {:baseName baseName
                        :name (strip-color-codes (resolve-tokens name table))
                        :rarity (item-rarity baseName)
+                       :level (item-level baseName)
                        :w (:width dims)
                        :h (:height dims)}))
                   page)}))

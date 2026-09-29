@@ -154,6 +154,10 @@
     position: absolute; left: 2px; top: 1px;
     font-size: 8px; opacity: 0.85; letter-spacing: 0.5px;
   }
+  .stash-item .st-level {
+    position: absolute; right: 2px; top: 1px;
+    font-size: 8px; color: #8fd3ff; opacity: 0.9;
+  }
   #stash-empty { color: var(--muted); text-align: center; margin-top: 30px; }
   .catalog-list { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
   .catalog-list th {
@@ -209,6 +213,7 @@
   .picker-row.disabled { opacity: 0.45; cursor: default; }
   .picker-row .pk-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .picker-row .pk-rarity { width: 56px; font-size: 11px; }
+  .picker-row .pk-level { width: 42px; flex: none; text-align: right; color: var(--muted); font-size: 11px; }
   .picker-row .pk-dims { width: 60px; flex: none; text-align: right; color: var(--muted); font-size: 11px; }
   .picker-foot {
     display: flex; align-items: center; gap: 10px;
@@ -867,6 +872,12 @@ function renderStashGrid(data, index, kind) {
       rt.textContent = rarityText()[rarity];
       div.appendChild(rt);
     }
+    if (it.level) {
+      var lv = document.createElement("span");
+      lv.className = "st-level";
+      lv.textContent = "Lv" + it.level;
+      div.appendChild(lv);
+    }
     if (pref("gdw.showName", true) && it.name) {
       var sn = document.createElement("span");
       sn.className = "st-name";
@@ -880,6 +891,7 @@ function renderStashGrid(data, index, kind) {
       div.appendChild(sc);
     }
     var tip = [nm];
+    if (it.level) tip.push("等级: " + it.level);
     if (it.prefixName) tip.push("前缀: " + it.prefixName);
     if (it.suffixName) tip.push("后缀: " + it.suffixName);
     if (rarity) tip.push("稀有度: " + (rarityText()[rarity] || rarity));
@@ -974,6 +986,12 @@ function renderItems(items) {
       if (RARITY_COLORS[it.rarity]) cRarity.style.color = RARITY_COLORS[it.rarity];
     }
     row.appendChild(cRarity);
+    if (it.level) {
+      var cLevel = document.createElement("span");
+      cLevel.className = "pk-level";
+      cLevel.textContent = "Lv" + it.level;
+      row.appendChild(cLevel);
+    }
     var cDims = document.createElement("span");
     cDims.className = "pk-dims";
     cDims.textContent = dimsOk ? (it.w + "×" + it.h) : "无法占格";
