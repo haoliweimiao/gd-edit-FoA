@@ -339,6 +339,45 @@
       path)
     path))
 
+(defn- baseitem-loottable-path
+  [dbr]
+  (as-> (str/split dbr #"/") $
+        (nth $ 2)
+        (str "records/items/loottables/" $ "/")))
+
+(defn- all-loottable-records
+  [db]
+  (filter (fn [item]
+            (str/starts-with? (:recordname item) "records/items/loottables/"))
+          db))
+
+(defn- loottable-records-with-mentions
+  [loottables mentioned-value]
+  (filter (fn [item]
+            (some #(= (val %) mentioned-value) item))
+          loottables))
+
+(defn- baseitem-valid-affix-paths
+  "给定基础件 dbr 路径，回溯其可合法 roll 的前缀/后缀集合（借鉴 commands/item.clj）。
+   依据：引用该基础件的 loottable 里 prefix/suffix 表（含稀有变体）中的 randomizerName 全集。
+   神话/苏醒/传奇等特殊档、以及 db-index 外记录不会被任何 loottable 引用，返回空集。"
+  [baseitem-dbr-path]
+  (try
+    (let [db (dbu/db)
+          db-idx (dbu/db-recordname-index)
+          loottables (loottable-records-with-mentions
+                      (all-loottable-records db) baseitem-dbr-path)
+          collect (fn [key-prefixes]
+                    (->> (mapcat (fn [k]
+                                   (mapcat #(u/collect-values-with-key-prefix % k) loottables))
+                                 key-prefixes)
+                         (map #(u/collect-values-with-key-prefix (get db-idx %) "randomizerName"))
+                         (apply concat)
+                         (into #{})))]
+      {:prefix (collect ["prefixTableName" "rarePrefixTableName"])
+       :suffix (collect ["suffixTableName" "rareSuffixTableName"])})
+    (catch Throwable _ {:prefix #{} :suffix #{}})))
+
 (defn- strip-color-codes
   "去除 GD 文本颜色码（如 ^g/^y/^l）残留。"
   [s]
@@ -413,17 +452,36 @@
                                (when color (name color))]))))))
     (catch Throwable _ [])))
 
+(defn- affix-paths-payload
+  "合法词缀集合 → [{path name level}]（名称本地化，按名称排序）。"
+  [paths table]
+  (->> paths
+       (keep (fn [p]
+               (when-let [rec (get @globals/db-index p)]
+                 (let [nm (str (get rec "lootRandomizerName"))]
+                   {:path p
+                    :name (strip-color-codes
+                           (resolve-tokens (if (str/blank? nm) p nm) table))
+                    :level (get rec "itemLevel")}))))
+       (sort-by (comp str/lower-case :name))
+       (vec)))
+
 (defn- item-detail-payload
   [it table]
   (let [nm (try (dbu/item-name it) (catch Throwable _ nil))
-        dims (stash-item-dims it)]
+        dims (stash-item-dims it)
+        va (baseitem-valid-affix-paths (:basename it))]
     {:name (strip-gd-markup (resolve-tokens nm table))
      :baseName (:basename it)
      :rarity (item-rarity (:basename it))
      :stackCount (:stack-count it)
      :w (:width dims)
      :h (:height dims)
-     :lines (item-detail-runs it table)}))
+     :lines (item-detail-runs it table)
+     :prefixPath (:prefix-name it)
+     :suffixPath (:suffix-name it)
+     :validAffixes {:prefix (affix-paths-payload (:prefix va) table)
+                    :suffix (affix-paths-payload (:suffix va) table)}}))
 
 (defn- stash-item-detail-payload
   [sack slot table]
@@ -761,6 +819,63 @@
             {:ok true :backup backup :removed (:basename it)}
             (throw (ex-info "写入校验失败，物品未删除" {:status 500}))))))))
 
+(def ^:private affix-recordname-re #"^records/items/lootaffixes/(prefix|suffix)/[A-Za-z0-9_.-]+\.dbr$")
+
+(defn- char-item-loc
+  "定位角色内物品：返回 [gdc-data keypath item]；参数无效/越界/空槽返回 nil。"
+  [path source sack-idx set-idx slot-idx]
+  (let [c (gdc/load-character-file path)]
+    (case source
+      "sack" (when (and (some? sack-idx) (some? slot-idx))
+               (when-let [sack (nth (:inventory-sacks c) sack-idx nil)]
+                 (when (and (<= 0 slot-idx) (< slot-idx (count (:inventory-items sack))))
+                   (when-let [it (nth (:inventory-items sack) slot-idx nil)]
+                     (when (has-item? it)
+                       [c [:inventory-sacks sack-idx :inventory-items slot-idx] it])))))
+      "equip" (when (and (some? slot-idx) (<= 0 slot-idx) (< slot-idx (count (:equipment c))))
+                (when-let [it (nth (:equipment c) slot-idx nil)]
+                  (when (has-item? it)
+                    [c [:equipment slot-idx] it])))
+      "weapon" (when (and (some? set-idx) (some? slot-idx))
+                 (when-let [ws (nth (:weapon-sets c) set-idx nil)]
+                   (when (and (<= 0 slot-idx) (< slot-idx (count (:items ws))))
+                     (when-let [it (nth (:items ws) slot-idx nil)]
+                       (when (has-item? it)
+                         [c [:weapon-sets set-idx :items slot-idx] it]))))))))
+
+(defn- set-char-item-affix!
+  "修改角色指定槽位物品的前缀/后缀（affix-path 空串或 nil = 清除词缀）。
+   写档前自动备份；重载校验 basename 不变且新字段值正确。"
+  [path source sack-idx set-idx slot-idx kind affix-path]
+  (ensure-gdx3-loaded!)
+  (when-not (contains? #{"prefix" "suffix"} kind)
+    (throw (ex-info "无效的词缀类型" {:status 400})))
+  (when (and (seq affix-path) (not (re-matches affix-recordname-re affix-path)))
+    (throw (ex-info "无效的词缀路径" {:status 400})))
+  (let [[c kp it] (or (char-item-loc path source sack-idx set-idx slot-idx)
+                      (throw (ex-info "物品不存在或定位参数无效" {:status 400})))
+        base (:basename it)
+        new-affix (if (seq affix-path) affix-path "")
+        field (if (= kind "prefix") :prefix-name :suffix-name)
+        other-field (if (= kind "prefix") :suffix-name :prefix-name)
+        valid (baseitem-valid-affix-paths base)
+        valid-set (get valid (keyword kind))]
+    (when (and (seq affix-path) (not (contains? valid-set affix-path)))
+      (throw (ex-info "该词缀不属于此装备的合法词缀" {:status 400})))
+    (let [backup (backup-copy! path)
+          c2 (assoc-in c (conj kp field) new-affix)]
+      (gdc/write-character-file c2 path)
+      (let [item' (get-in (gdc/load-character-file path) kp)]
+        (if (and (= (:basename item') base)
+                 (= (get item' field) new-affix))
+          {:ok true
+           :backup backup
+           :prefix (if (= kind "prefix") new-affix (get item' other-field))
+           :suffix (if (= kind "suffix") new-affix (get item' other-field))
+           :name (try (strip-gd-markup (resolve-tokens (dbu/item-name item') (lang-table "zh")))
+                      (catch Throwable _ nil))}
+          (throw (ex-info "写入校验失败，词缀未修改" {:status 500})))))))
+
 (defn- handle-inventory-item-delete
   [exchange]
   (let [body (money-request-payload exchange)
@@ -840,6 +955,51 @@
     (if raw
       (try (Integer/parseInt raw) (catch Throwable _ nil))
       default)))
+
+(defn- handle-inventory-item-affix
+  "POST /api/character/inventory/item/affix {path q kind affixPath}
+   q 为与物品详情端点相同的定位串（source&sack&set&slot），kind∈{prefix,suffix}，
+   affixPath 空串/nil=清除该词缀。"
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        q (:q body)
+        kind (:kind body)
+        affix-path (:affixPath body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (and (string? q) (seq q)))
+      (send-json! exchange 400 {:ok false :error "缺少物品定位参数(q)"})
+
+      (not (contains? #{"prefix" "suffix"} kind))
+      (send-json! exchange 400 {:ok false :error "无效的词缀类型"})
+
+      :else
+      (let [source (or (parse-query-param q "source") "sack")
+            sack (parse-int-param q "sack" nil)
+            set (parse-int-param q "set" nil)
+            slot (parse-int-param q "slot" nil)]
+        (cond
+          (not (contains? #{"sack" "equip" "weapon"} source))
+          (send-json! exchange 400 {:ok false :error "未知的 source（应为 sack/equip/weapon）"})
+
+          (nil? slot)
+          (send-json! exchange 400 {:ok false :error "缺少 slot 参数"})
+
+          :else
+          (try
+            (send-json! exchange 200
+                        (set-char-item-affix! path source sack set slot kind affix-path))
+            (catch clojure.lang.ExceptionInfo e
+              (send-json! exchange (or (:status (ex-data e)) 500)
+                          {:ok false :error (.getMessage e)}))
+            (catch Throwable e
+              (send-json! exchange 500 {:ok false :error (str e)}))))))))
 
 (defn- handle-char-backups
   [exchange query]
@@ -970,6 +1130,9 @@
 
         (and (= path "/api/character/inventory/item/delete") (= method "POST"))
         (handle-inventory-item-delete exchange)
+
+        (and (= path "/api/character/inventory/item/affix") (= method "POST"))
+        (handle-inventory-item-affix exchange)
 
         (and (= path "/api/character/inventory/item") query)
         (let [p (parse-query-param query "path")
