@@ -173,6 +173,54 @@
     (io/copy f (io/file backup-path))
     backup-path))
 
+(def ^:private backup-suffix-re #"\.bak-?\d+$")
+
+(defn- backup-files-of
+  "该存档同目录下所有合法备份（.bak{N} 与 .bak-YYYYMMDD），按序号升序。
+   不匹配后缀的忽略，绝不含存档本体。"
+  [path]
+  (let [f (io/file path)
+        filename (.getName f)
+        dir (.getParentFile f)]
+    (->> (.listFiles dir)
+         (filter #(.isFile %))
+         (keep (fn [bf]
+                 (let [nm (.getName bf)]
+                   (when (and (str/starts-with? nm filename)
+                              (re-matches backup-suffix-re (subs nm (count filename))))
+                     {:file nm
+                      :size (.length bf)
+                      :mtime (.lastModified bf)
+                      :index (Long/parseLong (str/replace (subs nm (+ (count filename) 4)) "-" ""))}))))
+         (sort-by :index)
+         (vec))))
+
+(defn- char-backups-payload
+  [path]
+  {:path path :backups (backup-files-of path)})
+
+(defn- delete-backs!
+  "删除指定备份文件名（仅 .bak{N}/.bak-YYYYMMDD，纯文件名、须在存档同目录）。
+   逐个尝试，不匹配/不存在记入 failed，不中断。"
+  [path names]
+  (let [f (io/file path)
+        filename (.getName f)
+        dir (.getParentFile f)
+        good? (fn [nm]
+                (and (string? nm)
+                     (= nm (.getName (io/file nm)))
+                     (str/starts-with? nm filename)
+                     (re-matches backup-suffix-re (subs nm (count filename)))))
+        files (map (fn [nm] [nm (io/file dir nm)]) names)]
+    (when-not (every? (comp good? first) files)
+      (throw (ex-info "存在非法的备份文件名" {:status 400})))
+    (reduce (fn [acc [nm bf]]
+              (if (and (.isFile bf) (.delete bf))
+                (update acc :deleted conj nm)
+                (update acc :failed conj nm)))
+            {:ok true :deleted [] :failed []}
+            files)))
+
 (defn- write-money!
   [path amount]
   (let [backup (backup-copy! path)
@@ -793,6 +841,37 @@
       (try (Integer/parseInt raw) (catch Throwable _ nil))
       default)))
 
+(defn- handle-char-backups
+  [exchange query]
+  (let [p (parse-query-param query "path")]
+    (if (and (string? p) (.isFile (io/file p)))
+      (send-json! exchange 200 (char-backups-payload p))
+      (send-json! exchange 400 {:error "无效的角色档案路径"}))))
+
+(defn- handle-backups-delete
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        files (:files body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (and (vector? files) (seq files) (every? string? files)))
+      (send-json! exchange 400 {:ok false :error "缺少合法的备份文件列表"})
+
+      :else
+      (try
+        (send-json! exchange 200 (delete-backs! path files))
+        (catch clojure.lang.ExceptionInfo e
+          (send-json! exchange (or (:status (ex-data e)) 500)
+                      {:ok false :error (.getMessage e)}))
+        (catch Throwable e
+          (send-json! exchange 500 {:ok false :error (str e)}))))))
+
 (defn- handle-items-search
   [exchange query]
   (let [q (parse-query-param query "q")
@@ -841,6 +920,12 @@
 
         (and (= path "/api/character/money") (= method "POST"))
         (handle-money-post exchange)
+
+        (and (= path "/api/character/backups") query)
+        (handle-char-backups exchange query)
+
+        (and (= path "/api/character/backups/delete") (= method "POST"))
+        (handle-backups-delete exchange)
 
         (= path "/api/character/money")
         (send-json! exchange 405 {:error "method not allowed"})

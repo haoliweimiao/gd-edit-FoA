@@ -218,6 +218,29 @@
   .picker-count input { width: 68px; }
   .picker-page { color: var(--muted); font-size: 12px; }
   .picker-foot #picker-add { margin-left: auto; }
+
+  /* ---- 备份管理 ---- */
+  #backup-overlay {
+    position: fixed; inset: 0; background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center; z-index: 20;
+  }
+  #backup {
+    width: 640px; max-width: 92vw; height: 68vh;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    display: flex; flex-direction: column; overflow: hidden;
+  }
+  #backup-list { flex: 1; overflow-y: auto; padding: 6px 0; }
+  .bk-row {
+    display: flex; align-items: center; gap: 10px;
+    padding: 5px 14px; font-size: 13px;
+  }
+  .bk-row:hover { background: rgba(255,255,255,0.05); }
+  .bk-row input { accent-color: var(--accent); margin: 0; }
+  .bk-file { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: monospace; }
+  .bk-size { width: 72px; flex: none; text-align: right; color: var(--muted); font-size: 11px; }
+  .bk-time { width: 150px; flex: none; text-align: right; color: var(--muted); font-size: 11px; }
+  .bk-empty { color: var(--muted); padding: 26px; text-align: center; font-size: 13px; }
+  #backup-delete { margin-left: auto; }
 </style>
 </head>
 <body>
@@ -237,6 +260,7 @@
     <div id="detail" style="display:none">
       <div class="char-title" id="char-name"></div>
       <button class="small-btn primary" id="inv-btn" style="margin-bottom:14px">查看背包</button>
+      <button class="small-btn" id="backup-btn" style="margin-bottom:14px">备份</button>
       <table id="attr-table"></table>
     </div>
     <div id="stash-view" style="display:none">
@@ -299,6 +323,21 @@
       <span class="picker-page" id="picker-page"></span>
       <button class="small-btn" id="picker-next">下一页</button>
       <button class="small-btn primary" id="picker-add">新增</button>
+    </div>
+  </div>
+</div>
+<div id="backup-overlay" style="display:none">
+  <div id="backup">
+    <div class="picker-head">
+      <span class="picker-title">备份管理</span>
+      <span class="picker-pos" id="backup-sub"></span>
+      <button class="small-btn" id="backup-close">✕</button>
+    </div>
+    <div id="backup-list"></div>
+    <div class="picker-foot">
+      <button class="small-btn" id="backup-selectall">全选</button>
+      <span class="picker-pos">每次写档自动生成 .bak 备份，确认无误后可清理</span>
+      <button class="small-btn danger" id="backup-delete">删除选中 (0)</button>
     </div>
   </div>
 </div>
@@ -1171,6 +1210,125 @@ $("picker-add").addEventListener("click", submitAdd);
 $("picker-count").addEventListener("keydown", function (e) {
   if (e.key === "Enter") submitAdd();
 });
+
+/* ---------- 备份管理 ---------- */
+var backupState = { files: [] };
+
+function openBackupManager() {
+  if (!stashState.charPath) { showError("请先选择角色"); return; }
+  var pc = stashState.charPath.split(/[\\/]/);
+  $("backup-sub").textContent = pc.slice(-2).join("/") + " 目录下的 .bak 备份";
+  $("backup-overlay").style.display = "flex";
+  loadBackups();
+}
+
+function closeBackupManager() { $("backup-overlay").style.display = "none"; }
+
+function loadBackups() {
+  var url = "/api/character/backups?path=" + encodeURIComponent(stashState.charPath);
+  fetch(url)
+    .then(function (r) { if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); })
+    .then(function (data) { backupState.files = data.backups || []; renderBackups(); })
+    .catch(function (e) { showError("加载备份列表失败: " + e.message); });
+}
+
+function fmtSize(b) {
+  if (b >= 1048576) return (b / 1048576).toFixed(1) + " MB";
+  if (b >= 1024) return (b / 1024).toFixed(0) + " KB";
+  return b + " B";
+}
+
+function bkSelectedNames() {
+  var names = [];
+  document.querySelectorAll("#backup-list input[type=checkbox]:checked").forEach(function (c) {
+    names.push(c.dataset.file);
+  });
+  return names;
+}
+
+function updateBkDeleteBtn() {
+  var n = bkSelectedNames().length;
+  var btn = $("backup-delete");
+  btn.textContent = "删除选中 (" + n + ")";
+  btn.disabled = n === 0;
+}
+
+function renderBackups() {
+  var list = $("backup-list");
+  list.innerHTML = "";
+  if (!backupState.files.length) {
+    var e = document.createElement("div");
+    e.className = "bk-empty";
+    e.textContent = "暂无备份";
+    list.appendChild(e);
+    $("backup-delete").disabled = true;
+    $("backup-delete").textContent = "删除选中 (0)";
+    return;
+  }
+  backupState.files.forEach(function (bk) {
+    var row = document.createElement("div");
+    row.className = "bk-row";
+    var cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.dataset.file = bk.file;
+    cb.addEventListener("change", updateBkDeleteBtn);
+    row.appendChild(cb);
+    var fName = document.createElement("span");
+    fName.className = "bk-file";
+    fName.textContent = bk.file;
+    fName.title = bk.file;
+    row.appendChild(fName);
+    var sName = document.createElement("span");
+    sName.className = "bk-size";
+    sName.textContent = fmtSize(bk.size);
+    row.appendChild(sName);
+    var tName = document.createElement("span");
+    tName.className = "bk-time";
+    tName.textContent = new Date(bk.mtime).toLocaleString();
+    row.appendChild(tName);
+    list.appendChild(row);
+  });
+  updateBkDeleteBtn();
+}
+
+function deleteBackups() {
+  var names = bkSelectedNames();
+  if (!names.length) return;
+  if (!confirm("确定删除选中的 " + names.length + " 个备份？\n删除后不可恢复。\n\n" +
+               names.slice(0, 8).join("\n") + (names.length > 8 ? "\n…" : ""))) return;
+  fetch("/api/character/backups/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ path: stashState.charPath, files: names })
+  })
+    .then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    })
+    .then(function (res) {
+      if (!res.ok) { showError((res.d && res.d.error) || "删除失败"); return; }
+      var d = res.d;
+      if (d.failed && d.failed.length) {
+        showError("部分删除失败: " + d.failed.join(", "));
+      } else {
+        showToast("已删除 " + d.deleted.length + " 个备份");
+      }
+      loadBackups();
+    })
+    .catch(function (e) { showError("删除失败: " + e.message); });
+}
+
+$("backup-btn").addEventListener("click", openBackupManager);
+$("backup-close").addEventListener("click", closeBackupManager);
+$("backup-overlay").addEventListener("click", function (e) {
+  if (e.target === $("backup-overlay")) closeBackupManager();
+});
+$("backup-selectall").addEventListener("click", function () {
+  var cbs = document.querySelectorAll("#backup-list input[type=checkbox]");
+  var allOn = cbs.length > 0 && Array.prototype.every.call(cbs, function (c) { return c.checked; });
+  cbs.forEach(function (c) { c.checked = !allOn; });
+  updateBkDeleteBtn();
+});
+$("backup-delete").addEventListener("click", deleteBackups);
 
 loadCharacters();
 </script>
