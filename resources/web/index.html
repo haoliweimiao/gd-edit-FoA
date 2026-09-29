@@ -264,6 +264,22 @@
   .ax-attrs { flex: 1 1 100%; width: 100%; padding: 2px 2px 0 0; }
   .ax-attrs .line { font-size: 11px; line-height: 1.5; color: #cfe4ff; }
   .ax-attrs .line.empty { height: 0; }
+
+  /* ---- 技能/专精（只读） ---- */
+  #skills-view { margin-top: 18px; }
+  #skills-view h3 { font-size: 14px; font-weight: 600; margin: 0 0 8px; color: var(--text); }
+  #skills-view .skills-points { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+  #skills-view details { margin-bottom: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-2); }
+  #skills-view summary { cursor: pointer; padding: 9px 12px; font-size: 13px; font-weight: 600; color: #cfe4ff; user-select: none; }
+  #skills-view summary:hover { background: rgba(255,255,255,0.05); }
+  #skills-view .inv { color: var(--muted); font-weight: 400; font-size: 11px; margin-left: 8px; }
+  #skills-view .sk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 4px 14px; padding: 6px 12px 12px; }
+  #skills-view .sk { display: flex; align-items: baseline; font-size: 12px; line-height: 1.6; }
+  #skills-view .sk-tier { flex: none; width: 20px; height: 20px; line-height: 20px; margin-right: 8px; border-radius: 4px;
+    text-align: center; font-size: 11px; font-weight: 600; color: #0f1216; background: linear-gradient(180deg,#e6e8ec,#b9c2cc); }
+  #skills-view .sk-name { flex: 1; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #skills-view .sk-lv { flex: none; color: var(--muted); font-size: 11px; margin-left: 8px; white-space: nowrap; }
+  #skills-view .sk-lv b { color: #ffd27a; }
 </style>
 </head>
 <body>
@@ -285,6 +301,7 @@
       <button class="small-btn primary" id="inv-btn" style="margin-bottom:14px">查看背包</button>
       <button class="small-btn" id="backup-btn" style="margin-bottom:14px">备份</button>
       <table id="attr-table"></table>
+      <div id="skills-view"></div>
     </div>
     <div id="stash-view" style="display:none">
       <div class="char-title">共享仓库</div>
@@ -497,6 +514,72 @@ function buildIronCell(td, value) {
   });
 }
 
+function renderSkills(skills, container) {
+  container.innerHTML = "";
+  if (!skills || !skills.masteries) return;
+  var h3 = document.createElement("h3");
+  h3.textContent = "技能 / 专精";
+  container.appendChild(h3);
+  var pts = document.createElement("div");
+  pts.className = "skills-points";
+  pts.textContent = "可用技能点: " + (skills["skill-points"] || 0)
+    + " · 属性点: " + (skills["attribute-points"] || 0)
+    + " · 虔诚点: " + (skills["devotion-points"] || 0);
+  container.appendChild(pts);
+
+  function skillLine(sk) {
+    var line = document.createElement("div");
+    line.className = "sk";
+    var tier = document.createElement("span");
+    tier.className = "sk-tier";
+    tier.textContent = sk.tier != null ? sk.tier : "–";
+    line.appendChild(tier);
+    var name = document.createElement("span");
+    name.className = "sk-name";
+    name.textContent = sk.name || sk.recordname || "?";
+    name.title = sk.recordname || "";
+    line.appendChild(name);
+    var lv = document.createElement("span");
+    lv.className = "sk-lv";
+    lv.innerHTML = "Lv <b>" + sk.level + "</b>" + (sk["max-level"] != null ? " / Max " + sk["max-level"] : "");
+    line.appendChild(lv);
+    return line;
+  }
+
+  (skills.masteries || []).forEach(function (m) {
+    var det = document.createElement("details");
+    det.open = true;
+    var sum = document.createElement("summary");
+    sum.textContent = m.name || ("专精 " + m.classIndex);
+    var inv = document.createElement("span");
+    inv.className = "inv";
+    inv.textContent = "已投入 " + m.invested + " 点";
+    sum.appendChild(inv);
+    det.appendChild(sum);
+    var grid = document.createElement("div");
+    grid.className = "sk-grid";
+    (m.skills || []).forEach(function (sk) { grid.appendChild(skillLine(sk)); });
+    det.appendChild(grid);
+    container.appendChild(det);
+  });
+
+  if (skills.devotion && skills.devotion.length) {
+    var detd = document.createElement("details");
+    var sumd = document.createElement("summary");
+    sumd.textContent = "虔诚技能";
+    var invd = document.createElement("span");
+    invd.className = "inv";
+    invd.textContent = skills.devotion.length + " 项";
+    sumd.appendChild(invd);
+    detd.appendChild(sumd);
+    var grid = document.createElement("div");
+    grid.className = "sk-grid";
+    skills.devotion.forEach(function (sk) { grid.appendChild(skillLine(sk)); });
+    detd.appendChild(grid);
+    container.appendChild(detd);
+  }
+}
+
 function showCharacter(path) {
   currentPath = path;
   stashState.charPath = path;
@@ -524,6 +607,7 @@ function showCharacter(path) {
       });
       $("detail-empty").style.display = "none";
       $("detail").style.display = "block";
+      renderSkills(data.skills, $("skills-view"));
     })
     .catch(function (e) { showError("加载角色数据失败: " + e.message); });
 }

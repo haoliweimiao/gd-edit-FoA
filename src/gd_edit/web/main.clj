@@ -28,6 +28,7 @@
 (def ^:private local-zh (atom {}))
 (def ^:private local-zh-merged (atom {}))
 (def ^:private page-html (atom nil))
+(def ^:private local-en-name-tags (atom {}))
 
 (defn- load-lang-table!
   [relative-path]
@@ -70,7 +71,9 @@
                                                            "Settings/text_zh")))))
   (reset! local-zh-merged
           (merge @local-en
-                 (into {} (remove (fn [[_ v]] (str/blank? v))) @local-zh))))
+                 (into {} (remove (fn [[_ v]] (str/blank? v))) @local-zh)))
+  (reset! local-en-name-tags
+          (reduce-kv (fn [m k v] (update m v (fnil conj []) k)) {} @local-en)))
 
 (defn- page-html!
   []
@@ -99,6 +102,68 @@
   (if (= lang "zh")
     @local-zh-merged
     @local-en))
+
+(def ^:private skill-name-tag-re #"^tag(GDX\d+)?Class\d+SkillName")
+
+(defn- safe-parse-int
+  "安全解析整数；接受整数或纯数字串，失败返回 nil。"
+  [s]
+  (cond
+    (integer? s) s
+    (and (string? s) (re-matches #"\d+" s))
+    (try (Long/parseLong s) (catch Exception _ nil))
+    :else nil))
+
+(defn- strip-gd-markup
+  "去除 GD 文本色彩/标记（^a ^g ^c 及 <...> 包裹），保留可读名称。"
+  [s]
+  (when s
+    (-> s
+        (str/replace #"\^[a-zA-Z]" "")
+        (str/replace #"[<>]" "")
+        (str/trim))))
+
+(defn- strip-gd-class-prefix
+  "去除开头的 GD 色彩职业前缀（如 '^g<^F死灵^g>^c' / 单个 '^a'），保留其后的技能名。"
+  [s]
+  (when s
+    (clojure.string/replace-first
+     s #"^(?:\^[a-zA-Z]|<[^<>]*(?:\^[a-zA-Z])*[^<>]*>)+" "")))
+
+(defn- prefer-skill-name-tag
+  "从候选 tag 键中优先取 skill-name 形态（如 tagClass06SkillName06A / tagGDX1Class08SkillName02A），否则取首个。"
+  [cands]
+  (or (some #(when (re-find skill-name-tag-re (name %)) %) cands)
+      (first cands)))
+
+(defn- skill-localized-name
+  "英文技能显示名 -> 本地化名。经英文表反查 tag 键，再用合并词表取值；失败回退英文名。
+   名称再去掉 GD 职业前缀与色彩标记。"
+  [english-name table]
+  (let [name (if (and (seq english-name) (seq table))
+               (if-let [tag (prefer-skill-name-tag (get @local-en-name-tags english-name))]
+                 (let [v (get table tag)]
+                   (if (str/blank? v) english-name v))
+                 english-name)
+               (or english-name ""))]
+    (-> name strip-gd-class-prefix strip-gd-markup)))
+
+(defn- parse-class-tags
+  "解析 player-class-name tag（如 tagSkillClassName0608）为专精序号向量，失败返回空。"
+  [tag]
+  (when (and (string? tag) (re-find #"tagSkillClassName" tag))
+    (->> (re-find #"tagSkillClassName(\d+)$" tag)
+         second
+         (re-seq #"..")
+         (mapv #(Long/parseLong %)))))
+
+(defn- mastery-name
+  "专精序号 -> 专精名（经 tagSkillClassNameNN 合并词表本地化，去掉 GD 色彩标记）。"
+  [class-index lang]
+  (when class-index
+    (strip-gd-markup
+     (resolve-tag (str "tagSkillClassName" (format "%02d" class-index))
+                  (lang-table lang)))))
 
 (defn- fmt-playtime
   [secs]
@@ -135,6 +200,8 @@
         (mapv (fn [c] {:name (:character-name c)
                        :path (:gdc-path c)})))})
 
+(declare skills-payload)
+
 (defn- character-payload
   [path lang]
   (let [c (gdc/load-character-file path)
@@ -150,7 +217,85 @@
                     display-fields)]
     {:name (:character-name c)
      :path path
-     :attributes attrs}))
+     :attributes attrs
+     :skills (skills-payload c lang)}))
+
+(def ^:private playerclass-re #"/playerclass(\d+)/")
+
+(defn- skill-class-index
+  "从技能路径提取专精序号（如 playerclass06 -> 6）；非专精技能返回 nil。"
+  [recordname]
+  (when-let [n (second (re-find playerclass-re recordname))]
+    (Long/parseLong n)))
+
+(defn- skill-tier-fields
+  "技能 tier/max-level：直接字段缺失时沿 buff/pet 链接记录取值（同 skill-name-from-record 模式）。"
+  [rec]
+  (when rec
+    (let [tier (get rec "skillTier")
+          maxl (get rec "skillMaxLevel")]
+      (if (and tier maxl)
+        {:tier (safe-parse-int tier) :max-level (safe-parse-int maxl)}
+        (if-let [link (or (get rec "buffSkillName") (get rec "petSkillName"))]
+          (when-let [lr (dbu/record-by-name link)]
+            {:tier (safe-parse-int (get lr "skillTier"))
+             :max-level (safe-parse-int (get lr "skillMaxLevel"))})
+          {:tier nil :max-level nil})))))
+
+(defn- skill-view
+  "单个已学技能 -> 前端展示结构（name/level/tier/max-level/active）。"
+  [s lang]
+  (let [rn (:skill-name s)
+        rec (if (seq rn) (dbu/record-by-name rn))
+        tf (skill-tier-fields rec)]
+    {:recordname rn
+     :name (skill-localized-name (dbu/skill-name-from-record rec) (lang-table lang))
+     :level (:level s)
+     :tier (:tier tf)
+     :max-level (:max-level tf)
+     :active (some? (:skill-active s))}))
+
+(defn- masteries-payload
+  "按专精分组角色已学（playerclass）技能，返回有序专精向量与虔诚技能向量。"
+  [c lang]
+  (let [by-class (reduce (fn [m s]
+                           (if-let [idx (skill-class-index (:skill-name s))]
+                             (if (str/includes? (:skill-name s) "_classtraining_")
+                               m
+                               (update m idx (fnil conj []) s))
+                             m))
+                         {}
+                         (:skills c))
+        class-order (distinct (concat (parse-class-tags (:player-class-name c))
+                                      (sort (keys by-class))))
+        masteries (->> class-order
+                       (keep (fn [idx]
+                               (let [skills (get by-class idx)]
+                                 (when (seq skills)
+                                   {:class-index idx
+                                    :name (mastery-name idx lang)
+                                    :invested (reduce + (map :level skills))
+                                    :skills (->> skills
+                                                 (map #(skill-view % lang))
+                                                 (sort-by (fn [v] (or (:tier v) 0))))})))))
+        devotion (let [raw (->> (:skills c)
+                                (filter #(and (seq (:skill-name %))
+                                              (str/starts-with? (:skill-name %) "records/skills/devotion/")
+                                              (pos? (:level %))))
+                                (map #(skill-view % lang)))]
+                   (->> (vals (reduce (fn [m v] (update m (:recordname v) (fn [o] (if (and o (>= (:level o) (:level v))) o v)))) {} raw))
+                        (sort-by (fn [v] (or (:tier v) 0)))))]
+    {:masteries (vec masteries)
+     :devotion (vec devotion)}))
+
+(defn- skills-payload
+  [c lang]
+  (let [{:keys [masteries devotion]} (masteries-payload c lang)]
+    {:skill-points (get c :skill-points)
+     :attribute-points (get c :attribute-points)
+     :devotion-points (get c :devotion-points)
+     :masteries masteries
+     :devotion devotion}))
 
 (declare send-json!)
 
