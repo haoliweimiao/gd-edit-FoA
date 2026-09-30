@@ -621,7 +621,8 @@
                     :name (strip-color-codes
                            (resolve-tokens (if (str/blank? nm) p nm) table))
                     :level (get rec "levelRequirement")
-                    :lines (effect-runs (isummary/effect-summary rec) table)}))))
+                    :lines (try (effect-runs (isummary/effect-summary rec) table)
+                                (catch Throwable _ []))}))))
        (sort-by (comp str/lower-case :name))
        (vec)))
 
@@ -1046,6 +1047,22 @@
                       (catch Throwable _ nil))}
           (throw (ex-info "写入校验失败，词缀未修改" {:status 500})))))))
 
+(defn- set-char-item-count!
+  "修改角色指定槽位物品的叠堆数量（stack-count）。
+   写档前自动备份；重载校验 basename 不变且新数量正确。"
+  [path source sack-idx set-idx slot-idx count]
+  (let [[c kp it] (or (char-item-loc path source sack-idx set-idx slot-idx)
+                      (throw (ex-info "物品不存在或定位参数无效" {:status 400})))
+        base (:basename it)]
+    (let [backup (backup-copy! path)
+          c2 (assoc-in c (conj kp :stack-count) count)]
+      (gdc/write-character-file c2 path)
+      (let [item' (get-in (gdc/load-character-file path) kp)]
+        (if (and (= (:basename item') base)
+                 (= (:stack-count item') count))
+          {:ok true :backup backup :stackCount count :baseName base}
+          (throw (ex-info "写入校验失败，数量未修改" {:status 500})))))))
+
 (defn- handle-inventory-item-delete
   [exchange]
   (let [body (money-request-payload exchange)
@@ -1165,6 +1182,49 @@
           (try
             (send-json! exchange 200
                         (set-char-item-affix! path source sack set slot kind affix-path))
+            (catch clojure.lang.ExceptionInfo e
+              (send-json! exchange (or (:status (ex-data e)) 500)
+                          {:ok false :error (.getMessage e)}))
+            (catch Throwable e
+              (send-json! exchange 500 {:ok false :error (str e)}))))))))
+
+(defn- handle-inventory-item-count
+  "POST /api/character/inventory/item/count {path q count}
+   q 为与物品详情端点相同的定位串（source&sack&set&slot），count 为新的叠堆数量。"
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        q (:q body)
+        count (:count body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (and (string? q) (seq q)))
+      (send-json! exchange 400 {:ok false :error "缺少物品定位参数(q)"})
+
+      (not (and (integer? count) (<= 1 count 9999)))
+      (send-json! exchange 400 {:ok false :error "数量必须是 1 ~ 9999 的整数"})
+
+      :else
+      (let [source (or (parse-query-param q "source") "sack")
+            sack (parse-int-param q "sack" nil)
+            set (parse-int-param q "set" nil)
+            slot (parse-int-param q "slot" nil)]
+        (cond
+          (not (contains? #{"sack" "equip" "weapon"} source))
+          (send-json! exchange 400 {:ok false :error "未知的 source（应为 sack/equip/weapon）"})
+
+          (nil? slot)
+          (send-json! exchange 400 {:ok false :error "缺少 slot 参数"})
+
+          :else
+          (try
+            (send-json! exchange 200
+                        (set-char-item-count! path source sack set slot count))
             (catch clojure.lang.ExceptionInfo e
               (send-json! exchange (or (:status (ex-data e)) 500)
                           {:ok false :error (.getMessage e)}))
@@ -1303,6 +1363,9 @@
 
         (and (= path "/api/character/inventory/item/affix") (= method "POST"))
         (handle-inventory-item-affix exchange)
+
+        (and (= path "/api/character/inventory/item/count") (= method "POST"))
+        (handle-inventory-item-count exchange)
 
         (and (= path "/api/character/inventory/item") query)
         (let [p (parse-query-param query "path")

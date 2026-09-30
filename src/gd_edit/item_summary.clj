@@ -417,12 +417,13 @@
     (cond
       (= [:duration :min] (take-last 2 components))
       (let [key-base (keywords->camelcase (drop-last 2 components))
-            duration v ;(maybe-resolve-v record v)
-            total-dmg (->> key-base
-                           (collect-val-range record)
-                           (map #(* % duration)))]
+            duration (maybe-resolve-v record v)
+            total-dmg (when (number? duration)
+                        (->> key-base
+                             (collect-val-range record)
+                             (keep #(when (number? %) (* % duration)))))]
 
-        (when-not (empty? total-dmg)
+        (when (and (number? duration) (seq total-dmg))
           (if (contains?+ components :retaliation)
             (if-let [chance (lookup-and-resolve record (str key-base "Chance"))]
               (format "%s Chance of %s %s Retaliation Damage over %s seconds"
@@ -733,9 +734,12 @@
              (or
               (record "levelRequirement")
               (record "itemLevel")))
-    (dec (int (eq/evaluate (record "itemSkillLevelEq")
-                           {"itemLevel" (or (record "itemLevel")
-                                             (record "levelRequirement"))})))))
+    (let [v (eq/evaluate (record "itemSkillLevelEq")
+                         {"itemLevel" (or (record "itemLevel")
+                                           (record "levelRequirement"))})]
+      ;; 方程无法解析时 eq/evaluate 可能返回 Failure 对象等非数值，防护之
+      (when (number? v)
+        (dec (int v))))))
 
 (defn effect-summary
   ([record]
