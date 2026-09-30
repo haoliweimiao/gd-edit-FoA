@@ -251,6 +251,33 @@
              %)
         (:skills c)))
 
+(def ^:private mastery-tier-milestones
+  "技能各 tier 轨道解锁所需的最低专精点数（gameengine masteryTierLvl）。"
+  [1 5 10 15 20 25 32 40 50])
+
+(defn- skill-required-mastery
+  "某技能点亮所需的最低专精点数（按其 skillTier 查里程碑）；tier 缺失/解析失败返回 0（不加限制）。"
+  [recordname]
+  (let [rec (dbu/record-by-name recordname)
+        v (get rec "skillTier")
+        t (some-> (if (vector? v) (first v) v) str (Long/parseLong))]
+    (if (and t (pos? t) (<= t (count mastery-tier-milestones)))
+      (mastery-tier-milestones (dec t))
+      0)))
+
+(defn- class-mastery-required
+  "该职业所有已加点技能所需的最大专精点数（0 = 本职业技能无门槛）。"
+  [c class-index]
+  (let [prefix (format "records/skills/playerclass%02d/" class-index)]
+    (reduce max 0
+            (keep (fn [s]
+                    (let [rn (:skill-name s)]
+                      (when (and (pos? (:level s))
+                                 (str/starts-with? rn prefix)
+                                 (not (str/includes? rn "_classtraining_")))
+                        (skill-required-mastery rn))))
+                  (:skills c)))))
+
 (defn- skill-view
   "单个已学技能 -> 前端展示结构（name/level/tier/max-level/active）。"
   [s lang]
@@ -288,6 +315,7 @@
                                     :invested (reduce + (map :level skills))
                                     :mastery-level (:level ct)
                                     :mastery-max 50
+                                    :mastery-required (class-mastery-required c idx)
                                     :has-mastery has-mastery
                                     :skills (->> skills
                                                  (map #(skill-view % lang))
@@ -1262,6 +1290,11 @@
                       (throw (ex-info "已达专精上限 50 或无可用的技能点" {:status 400})))
         (= delta -1) (when (< nl 1)
                        (throw (ex-info "专精至少需保持 1 点，无法继续撤回" {:status 400}))))
+      (when (= delta -1)
+        (let [req (class-mastery-required c class-index)]
+          (when (< nl req)
+            (throw (ex-info (str "已加点技能需要至少 " req " 点专精，无法继续撤回")
+                            {:status 400})))))
       (let [backup (backup-copy! path)
             new-sp (+ sp (- delta))
             c2 (-> c

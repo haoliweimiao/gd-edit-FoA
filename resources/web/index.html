@@ -568,6 +568,7 @@ function renderSkills(skills, container) {
     fill.className = "mb-fill";
     var lvl = m["mastery-level"] || 0;
     var max = m["mastery-max"] || 50;
+    var min = Math.max(1, m["mastery-required"] || 0);
     var sp = skills["skill-points"] || 0;
     fill.style.width = Math.min(100, Math.round(lvl / max * 100)) + "%";
     track.appendChild(fill);
@@ -578,7 +579,7 @@ function renderSkills(skills, container) {
     plus.className = "mb-btn"; plus.textContent = "＋";
     plus.title = "加一点（消耗 1 技能点）";
     plus.disabled = (lvl >= max) || (sp <= 0);
-    minus.disabled = (lvl <= 1);
+    minus.disabled = (lvl <= min);
     plus.addEventListener("click", function () { changeMastery(m, 1); });
     minus.addEventListener("click", function () { changeMastery(m, -1); });
     bar.appendChild(minus);
