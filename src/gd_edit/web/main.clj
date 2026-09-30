@@ -242,6 +242,15 @@
              :max-level (safe-parse-int (get lr "skillMaxLevel"))})
           {:tier nil :max-level nil})))))
 
+(defn- char-class-training-skill
+  "角色技能中该职业的专精训练记录（_classtraining_），无则 nil。其 :level 即专精条 0-50。"
+  [c class-index]
+  (some #(when (= (:skill-name %)
+                  (format "records/skills/playerclass%02d/_classtraining_class%02d.dbr"
+                          class-index class-index))
+             %)
+        (:skills c)))
+
 (defn- skill-view
   "单个已学技能 -> 前端展示结构（name/level/tier/max-level/active）。"
   [s lang]
@@ -270,11 +279,16 @@
                                       (sort (keys by-class))))
         masteries (->> class-order
                        (keep (fn [idx]
-                               (let [skills (get by-class idx)]
-                                 (when (seq skills)
+                               (let [skills (get by-class idx)
+                                     ct (char-class-training-skill c idx)
+                                     has-mastery (some? ct)]
+                                 (when (or (seq skills) has-mastery)
                                    {:class-index idx
                                     :name (mastery-name idx lang)
                                     :invested (reduce + (map :level skills))
+                                    :mastery-level (:level ct)
+                                    :mastery-max 50
+                                    :has-mastery has-mastery
                                     :skills (->> skills
                                                  (map #(skill-view % lang))
                                                  (sort-by (fn [v] (or (:tier v) 0))))})))))
@@ -1231,6 +1245,67 @@
             (catch Throwable e
               (send-json! exchange 500 {:ok false :error (str e)}))))))))
 
+(defn- set-char-mastery-point!
+  "调整角色某职业专精条等级（+1 消耗 1 技能点 / -1 返还 1 技能点）。
+   写档前自动备份；重载校验专精等级与技能点数均正确。"
+  [path class-index delta]
+  (when-not (contains? #{1 -1} delta)
+    (throw (ex-info "delta 必须为 +1 或 -1" {:status 400})))
+  (let [c (gdc/load-character-file path)
+        sk (char-class-training-skill c class-index)]
+    (when (or (nil? class-index) (nil? sk))
+      (throw (ex-info "角色未选择该职业或专精记录缺失" {:status 400})))
+    (let [nl (+ (:level sk) delta)
+          sp (:skill-points c)]
+      (cond
+        (= delta 1) (when (or (> nl 50) (< sp 1))
+                      (throw (ex-info "已达专精上限 50 或无可用的技能点" {:status 400})))
+        (= delta -1) (when (< nl 1)
+                       (throw (ex-info "专精至少需保持 1 点，无法继续撤回" {:status 400}))))
+      (let [backup (backup-copy! path)
+            new-sp (+ sp (- delta))
+            c2 (-> c
+                   (update :skills
+                           (fn [ss] (mapv (fn [s] (if (= s sk) (assoc s :level nl) s)) ss)))
+                   (assoc :skill-points new-sp))]
+        (gdc/write-character-file c2 path)
+        (let [c' (gdc/load-character-file path)
+              sk' (char-class-training-skill c' class-index)]
+          (if (and sk' (= (:level sk') nl) (= (:skill-points c') new-sp))
+            {:ok true :backup backup :masteryLevel nl :skillPoints new-sp}
+            (throw (ex-info "写入校验失败，专精点未修改" {:status 500}))))))))
+
+(defn- handle-mastery-change
+  "POST /api/character/mastery {path classIndex delta}
+   delta 为 +1(加一点)或 -1(撤回一点)，专精条等级 1~50，出资为共享技能点。"
+  [exchange]
+  (let [body (money-request-payload exchange)
+        path (:path body)
+        class-index (:classIndex body)
+        delta (:delta body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (and (string? path) (.isFile (io/file path))))
+      (send-json! exchange 400 {:ok false :error "无效的角色档案路径"})
+
+      (not (integer? class-index))
+      (send-json! exchange 400 {:ok false :error "classIndex 必须为整数"})
+
+      (not (contains? #{1 -1} delta))
+      (send-json! exchange 400 {:ok false :error "delta 必须为 +1 或 -1"})
+
+      :else
+      (try
+        (send-json! exchange 200
+                    (set-char-mastery-point! path class-index delta))
+        (catch clojure.lang.ExceptionInfo e
+          (send-json! exchange (or (:status (ex-data e)) 500)
+                      {:ok false :error (.getMessage e)}))
+        (catch Throwable e
+          (send-json! exchange 500 {:ok false :error (str e)}))))))
+
 (defn- handle-char-backups
   [exchange query]
   (let [p (parse-query-param query "path")]
@@ -1366,6 +1441,9 @@
 
         (and (= path "/api/character/inventory/item/count") (= method "POST"))
         (handle-inventory-item-count exchange)
+
+        (and (= path "/api/character/mastery") (= method "POST"))
+        (handle-mastery-change exchange)
 
         (and (= path "/api/character/inventory/item") query)
         (let [p (parse-query-param query "path")
