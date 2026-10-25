@@ -586,6 +586,40 @@
    {:struct/read read-hotslot
     :struct/write write-hotslot}))
 
+(defn- block14-hotslots-trailing-bytes
+  "hotslots 之后、块尾之前的固定尾部字节数（camera-distance 4B；仅块版本 6 另有 14-unk1 4B）。"
+  [version]
+  (+ 4 (if (= version 6) 4 0)))
+
+(defn- read-block14-hotslots
+  "动态读取 block14 的 hotslots：槽位数随角色/存档而变（GD 1.3/FoA 下 47 与 95 并存），
+  无法用单一固定计数覆盖。这里从当前字节位置循环读取，直到块尾只剩尾部固定字段为止；
+  结束位置由 read-block 写入 context 的 :block-end-position 提供。"
+  [^ByteBuffer bb data context]
+  (let [end (:block-end-position @context)
+        trailing (block14-hotslots-trailing-bytes (:version data))]
+    (loop [slots []]
+      (if (<= (- end (.position bb)) trailing)
+        slots
+        (recur (conj slots (s/read-struct HotSlot bb context)))))))
+
+(defn- write-block14-hotslots
+  "写回 hotslots：按实际槽位向量逐项写出，读入多少个就写多少个。"
+  [^ByteBuffer bb data context]
+  (doseq [hs data]
+    (s/write-struct HotSlot bb hs context)))
+
+(def ^:private Block14Hotslots
+  (vary-meta HotSlot merge {:struct/type :block14-hotslots}))
+
+(defmethod s/read-spec :block14-hotslots
+  [spec ^ByteBuffer bb data context]
+  (read-block14-hotslots bb data context))
+
+(defmethod s/write-spec :block14-hotslots
+  [spec ^ByteBuffer bb data context]
+  (write-block14-hotslots bb data context))
+
 (def Block14
   (s/struct-def
    :version                :int32
@@ -604,24 +638,7 @@
    :14-unk3                 (after-block-version 7 :int32)
    :14-unk4                 (after-block-version 7 :int32)
 
-   :hotslots                (s/conditional
-                             (fn [data context]
-                               (let [version-data (if (= (:mode @context) :write)
-                                                    (peek (:anchor-stack @context))
-                                                    data)
-                                     version (:version version-data)]
-                                 (cond
-                                   (= version 4)
-                                   (s/array HotSlot :length 36)
-
-                                   ;; Version 7+ grows the hotbar to 47 slots. Verified against both
-                                   ;; a pre-1.3 and a GD 1.3 FoA save (both carry block14 version 7);
-                                   ;; the block length assertion holds only with 47 (46/95 both fail).
-                                   (>= version 7)
-                                   (s/array HotSlot :length 47)
-
-                                   :else
-                                   (s/array HotSlot :length 46)))))
+   :hotslots                Block14Hotslots
    :camera-distance        :float
 
    ;; Present in version 6 only; removed again when hotslots expanded in version 7+
@@ -1194,7 +1211,9 @@
 
          ;; Try to read the block
          ;; If a custom read function was provided, use that
-         ;; Otherwise, try to read using a block spec
+         ;; Otherwise, try to read using a block spec.
+         ;; 记录本块预期结束位置，供块内子字段按块尾动态定长读取（如 block14 hotslots）。
+         _ (swap! context assoc :block-end-position expected-end-position)
          block-data (s/read-struct block-spec-or-read-fn bb context)
 
          _ (when *debug*
