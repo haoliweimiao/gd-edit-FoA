@@ -189,8 +189,10 @@
         [(subs s 0 (+ idx 4)) (+ i idx 4)]))))
 
 (defn- extract-catalog-records
-  "从解密后内容中逐串自检出全部物品记录。返回 [{:path \"...dbr\" :start 记录首字节 :count N}]，
-  其中 count 为记录尾随数据首字节 ^ k（已验证 = 数量低 8 位）。"
+  "从解密后内容中逐串自检出全部物品记录。返回 [{:path \"...dbr\" :start 记录首字节 :count N}]。
+   实测布局：[8B头] N×([20B记录块][路径串]) [8B尾]；块 byte0 = 数量（u8），
+   块 byte4 明文恒为 0，故块掩码 = raw[start-16]，数量 = raw[start-20] ^ raw[start-16]。
+   （路径后首字节属于下一记录块，不能用作本记录数量。）"
   [^bytes content]
   (let [raw (mapv #(bit-and 0xff (long %)) content)
         n (count raw)
@@ -205,8 +207,9 @@
               (recur (+ i m 1)
                      (conj! acc {:path path
                                  :start i
-                                 :count (when (< pe n)
-                                          (bit-and 0xff (bit-xor (nth raw pe) k)))}))
+                                 :count (when (>= i 20)
+                                          (bit-and 0xff (bit-xor (nth raw (- i 20))
+                                                                 (nth raw (- i 16)))))}))
               (recur (inc i) acc))
             (recur (inc i) acc)))))))
 

@@ -736,6 +736,26 @@
        :height (:height sack)
        :items (stash-items-payload sack table)})))
 
+(defn- set-stash-item-count!
+  "修改公共仓库指定页/槽位物品的叠堆数量（stack-count）。
+   写档前自动备份；重载校验 basename 不变且新数量正确。"
+  [mode page slot count]
+  (let [path (stash-file-path mode)
+        s (st/load-stash-file path)
+        kp [:stash page :inventory-items slot]
+        it (get-in s kp)]
+    (when (nil? it)
+      (throw (ex-info "物品不存在或定位参数无效" {:status 400})))
+    (let [base (:basename it)
+          backup (backup-copy! path)
+          s2 (assoc-in s (conj kp :stack-count) count)]
+      (st/write-stash-file s2 path)
+      (let [item' (get-in (st/load-stash-file path) kp)]
+        (if (and (= (:basename item') base)
+                 (= (:stack-count item') count))
+          {:ok true :backup backup :stackCount count :baseName base}
+          (throw (ex-info "写入校验失败，数量未修改" {:status 500})))))))
+
 ;; GD 1.3 目录附页（magic=1 容器）：镶嵌物+材料 目录，无网格，只有物品列表。
 (def ^:private catalog-kinds
   ^:export ["reagents"])
@@ -1273,6 +1293,43 @@
             (catch Throwable e
               (send-json! exchange 500 {:ok false :error (str e)}))))))))
 
+(defn- handle-stash-item-count
+  "POST /api/stash/item/count {mode page slot count}
+   修改公共仓库指定页/槽位物品的叠堆数量，写档前自动备份。"
+  [exchange]
+  (let [body (money-request-payload exchange)
+        mode (or (:mode body) "standard")
+        page (:page body)
+        slot (:slot body)
+        count (:count body)]
+    (cond
+      (nil? body)
+      (send-json! exchange 400 {:ok false :error "请求体不是合法 JSON"})
+
+      (not (contains? #{"standard" "hardcore"} mode))
+      (send-json! exchange 400 {:ok false :error "无效的仓库模式（应为 standard/hardcore）"})
+
+      (not (and (integer? page) (<= 0 page)))
+      (send-json! exchange 400 {:ok false :error "无效的仓库页序号"})
+
+      (not (and (integer? slot) (<= 0 slot)))
+      (send-json! exchange 400 {:ok false :error "无效的物品槽位"})
+
+      (not (and (integer? count) (<= 1 count 9999)))
+      (send-json! exchange 400 {:ok false :error "数量必须是 1 ~ 9999 的整数"})
+
+      (not (.isFile (io/file (stash-file-path mode))))
+      (send-json! exchange 404 {:ok false :error (str "未找到共享仓库文件: " (stash-file-path mode))})
+
+      :else
+      (try
+        (send-json! exchange 200 (set-stash-item-count! mode page slot count))
+        (catch clojure.lang.ExceptionInfo e
+          (send-json! exchange (or (:status (ex-data e)) 500)
+                      {:ok false :error (.getMessage e)}))
+        (catch Throwable e
+          (send-json! exchange 500 {:ok false :error (str e)}))))))
+
 (defn- set-char-mastery-point!
   "调整角色某职业专精条等级（+1 消耗 1 技能点 / -1 返还 1 技能点）。
    写档前自动备份；重载校验专精等级与技能点数均正确。"
@@ -1474,6 +1531,9 @@
 
         (and (= path "/api/character/inventory/item/count") (= method "POST"))
         (handle-inventory-item-count exchange)
+
+        (and (= path "/api/stash/item/count") (= method "POST"))
+        (handle-stash-item-count exchange)
 
         (and (= path "/api/character/mastery") (= method "POST"))
         (handle-mastery-change exchange)

@@ -593,7 +593,7 @@ function renderSkills(skills, container) {
     var det = document.createElement("details");
     det.open = true;
     var sum = document.createElement("summary");
-    sum.textContent = m.name || ("专精 " + m.classIndex);
+    sum.textContent = m.name || ("专精 " + m["class-index"]);
     var inv = document.createElement("span");
     inv.className = "inv";
     inv.textContent = "已投入 " + m.invested + " 点";
@@ -628,7 +628,7 @@ function changeMastery(m, delta) {
   fetch("/api/character/mastery", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ path: currentPath || stashState.charPath, classIndex: m.classIndex, delta: delta })
+    body: JSON.stringify({ path: currentPath || stashState.charPath, classIndex: m["class-index"], delta: delta })
   })
     .then(function (r) { return r.json().then(function (d) { return { ok: r.ok, d: d }; }); })
     .then(function (res) {
@@ -1314,6 +1314,32 @@ function setSackItemCount(sel, val) {
     .catch(function (e) { showError("修改数量失败: " + e.message); });
 }
 
+function setStashItemCount(sel, val) {
+  var n = parseInt(val, 10);
+  if (!(n >= 1 && n <= 9999)) { showError("数量必须是 1~9999 的整数"); return; }
+  var it = sel.it;
+  var label = it.name || it.baseName || "该物品";
+  if (!confirm("确定要把“" + label + "”的叠堆数量改为 " + n + " 吗？\n修改前会自动备份，可通过备份恢复。")) return;
+  fetch("/api/stash/item/count", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ mode: stashState.mode, page: stashState.curPage, slot: it.slot, count: n })
+  })
+    .then(function (r) {
+      return r.json().then(function (d) { return { ok: r.ok, d: d }; });
+    })
+    .then(function (res) {
+      if (res.ok && res.d.ok) {
+        showToast("已修改数量为 " + res.d.stackCount + "（备份: " + res.d.backup + "）");
+        clearItemDetail();
+        loadStashPage(stashState.pages[stashState.cur]);
+      } else {
+        showError((res.d && res.d.error) || "修改数量失败");
+      }
+    })
+    .catch(function (e) { showError("修改数量失败: " + e.message); });
+}
+
 function clearItemDetail() {
   stashState.selected = null;
   document.querySelectorAll(".stash-item.selected, .catalog-list tr.selected")
@@ -1370,31 +1396,36 @@ function loadItemDetail() {
       if (data.prefixLevel) lvLines.push([[[ "前缀 等级: " + data.prefixLevel, "" ]]]);
       if (data.suffixLevel) lvLines.push([[[ "后缀 等级: " + data.suffixLevel, "" ]]]);
       renderItemDetailLines(lines, lvLines.concat(detailLines));
-      if (stashState.source === "char" && sel.q.indexOf("source=sack") === 0) {
-        var del = document.createElement("button");
-        del.className = "small-btn danger";
-        del.textContent = "删除";
-        del.title = "从背包袋中移除该物品（写入前自动备份）";
-        del.addEventListener("click", function () { deleteSackItem(sel); });
-        head.appendChild(del);
-        if (data.stackCount > 1) {
-          var qtyWrap = document.createElement("div");
-          qtyWrap.className = "qty-editor";
-          var qtyIn = document.createElement("input");
-          qtyIn.type = "number";
-          qtyIn.min = 1;
-          qtyIn.max = 9999;
-          qtyIn.value = data.stackCount;
-          qtyIn.title = "新的叠堆数量";
-          var qtyBtn = document.createElement("button");
-          qtyBtn.className = "small-btn";
-          qtyBtn.textContent = "改数量";
-          qtyBtn.title = "修改该材料的叠堆数量（写入前自动备份）";
-          qtyBtn.addEventListener("click", function () { setSackItemCount(sel, qtyIn.value); });
-          qtyWrap.appendChild(qtyIn);
-          qtyWrap.appendChild(qtyBtn);
-          head.appendChild(qtyWrap);
+      var isSackItem = stashState.source === "char" && sel.q.indexOf("source=sack") === 0;
+      var isStashGridItem = stashState.source === "stash" && sel.q.indexOf("page=") === 0;
+      if (isSackItem || isStashGridItem) {
+        if (isSackItem) {
+          var del = document.createElement("button");
+          del.className = "small-btn danger";
+          del.textContent = "删除";
+          del.title = "从背包袋中移除该物品（写入前自动备份）";
+          del.addEventListener("click", function () { deleteSackItem(sel); });
+          head.appendChild(del);
         }
+        var qtyWrap = document.createElement("div");
+        qtyWrap.className = "qty-editor";
+        var qtyIn = document.createElement("input");
+        qtyIn.type = "number";
+        qtyIn.min = 1;
+        qtyIn.max = 9999;
+        qtyIn.value = data.stackCount || 1;
+        qtyIn.title = "新的叠堆数量";
+        var qtyBtn = document.createElement("button");
+        qtyBtn.className = "small-btn";
+        qtyBtn.textContent = "改数量";
+        qtyBtn.title = "修改该物品的叠堆数量（写入前自动备份）";
+        qtyBtn.addEventListener("click", function () {
+          if (isStashGridItem) setStashItemCount(sel, qtyIn.value);
+          else setSackItemCount(sel, qtyIn.value);
+        });
+        qtyWrap.appendChild(qtyIn);
+        qtyWrap.appendChild(qtyBtn);
+        head.appendChild(qtyWrap);
       }
       if (stashState.source === "char") {
         var va = data.validAffixes || {};
